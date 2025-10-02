@@ -1,0 +1,39 @@
+{
+  "name": "poly5",
+  "version": "1.0.0",
+  "description": "Bot de Market Making pour Polymarket",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "build": "tsc",
+    "dev": "ts-node --watch src/index.ts",
+    "whoami": "ts-node scripts/whoami.ts",
+    "create:clobkey": "ts-node scripts/create-clob-key.ts",
+    "test:custom": "ts-node scripts/test-custom-clob.ts",
+    "test:auth": "ts-node scripts/test-auth.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "polymarket",
+    "market-making",
+    "trading",
+    "bot"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@polymarket/real-time-data-client": "^1.4.0",
+    "axios": "^1.12.2",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.15.0",
+    "pino": "^9.12.0",
+    "ws": "^8.18.3",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.1",
+    "@types/ws": "^8.18.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
