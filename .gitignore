@@ -12,6 +12,8 @@ build/
 # Logs
 *.log
 logs/
+bot-logs*.txt
+bot-live.txt
 
 # OS generated files
 .DS_Store
@@ -24,3 +26,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Bot data files (runtime)
+.inventory.json
+.pnl.json
+.activeOrders.json
