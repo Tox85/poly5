@@ -40,21 +40,20 @@ async function main() {
     console.log(`📍 Adresse Maker: ${clob.getMakerAddress()}`);
 
     // Test 1: Récupérer les balances
-    console.log("\n🔍 Test 1: Récupération des balances...");
+    console.log("\n🔍 Test 1: balance & allowance (USDC)...");
     try {
-      const balances = await clob.getBalances();
-      console.log("✅ Balances récupérées:", JSON.stringify(balances, null, 2));
+      const balances = await clob.getBalances();  // 👈 plus de césure
+      console.log("✅ Balance-allowance:", JSON.stringify(balances, null, 2));
     } catch (error: any) {
       console.error("❌ Erreur balances:", error.response?.data || error.message);
     }
 
-    // Test 2: Récupérer les ordres
-    console.log("\n🔍 Test 2: Récupération des ordres...");
+    console.log("\n🔍 Test 2: open orders...");
     try {
       const orders = await clob.getOrders();
-      console.log("✅ Ordres récupérés:", JSON.stringify(orders, null, 2));
-    } catch (error: any) {
-      console.error("❌ Erreur ordres:", error.response?.data || error.message);
+      console.log("✅ Open orders:", JSON.stringify(orders, null, 2));
+    } catch (e: any) {
+      console.error("❌ Erreur orders:", e.response?.data || e.message);
     }
 
     // Test 3: Test d'un ordre en mode DRY (simulation)
@@ -77,7 +76,7 @@ async function main() {
         expiration: "0",
         nonce: "0",
         feeRateBps: "0",
-        signatureType: 0,
+        signatureType: 2, // Gnosis Safe
         signature: "0x" // Sera rempli par le client
       },
       owner: process.env.CLOB_API_KEY!,

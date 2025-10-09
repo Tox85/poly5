@@ -1,41 +1,79 @@
-import * as dotenv from "dotenv";
-import { Wallet } from "ethers";
+// Configuration centralisée pour Polymarket
+// Exchange (Polygon) - CTFExchange verifyingContract
+export const EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+export const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // USDC sur Polygon
+export const CHAIN_ID = 137;
+export const RPC_URL = process.env.RPC_URL || "https://polygon-rpc.com";
+export const POLY_PROXY_ADDRESS = process.env.POLY_PROXY_ADDRESS || "";
+export const WSS_URL = process.env.WSS_URL || "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
-// Charger les variables d'environnement
-dotenv.config();
+// Configuration des logs
+export const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 
-// Endpoints de l'API Polymarket
-export const CLOB_API_URL = process.env.CLOB_API_URL || "https://clob.polymarket.com"; 
-export const WS_MARKET_URL = process.env.WS_URL || "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+// Configuration du market making
+export const DECIMALS = 1_000_000n; // USDC & CTF = 6 décimales sur Polymarket
+export const PLACE_EVERY_MS = 1500; // Anti-spam pour les logs
 
-// Identifiants d'authentification (depuis .env)
-export const PRIVATE_KEY = process.env.PRIVATE_KEY as string;
-export const API_KEY = process.env.CLOB_API_KEY as string;
-export const API_SECRET = process.env.CLOB_API_SECRET as string;
-export const API_PASSPHRASE = process.env.CLOB_PASSPHRASE as string;
-export const PROXY_ADDRESS = process.env.POLY_PROXY_ADDRESS as string;  // Adresse du wallet proxy Polymarket
+// Configuration du bot (depuis .env)
+export const TARGET_SPREAD_CENTS = Number(process.env.TARGET_SPREAD_CENTS) || 3; // Augmenté à 3¢ pour rentabilité
+export const TICK_IMPROVEMENT = Number(process.env.TICK_IMPROVEMENT) || 0; // 0 = exactement au best bid/ask
+export const NOTIONAL_PER_ORDER_USDC = Number(process.env.NOTIONAL_PER_ORDER_USDC) || 1.5; // Réduit à 1.5$ pour économiser le capital
+export const MAX_ACTIVE_ORDERS = Number(process.env.MAX_ACTIVE_ORDERS) || 100;
+export const REPLACE_COOLDOWN_MS = Number(process.env.REPLACE_COOLDOWN_MS) || 1500;
+export const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS) || 30000;
+export const PRICE_CHANGE_THRESHOLD = Number(process.env.PRICE_CHANGE_THRESHOLD) || 0.001;
+export const PROXY_ADDRESS = process.env.POLY_PROXY_ADDRESS!;
+export const DRY_RUN = process.env.DRY_RUN === "true";
 
-// Paramètres du bot (avec valeurs par défaut si non fournies)
-export const MAX_MARKETS = Number(process.env.MAX_MARKETS || 2);
-export const QUOTE_USDC_PER_SIDE = Number(process.env.QUOTE_USDC_PER_SIDE || 2);
-export const TARGET_SPREAD = Number(process.env.TARGET_SPREAD || 0.005); // Réduit à 0.5 centime
-export const MIN_24H_VOLUME = Number(process.env.MIN_24H_VOLUME || 50); // Réduit à 50 USDC
+// Configuration de l'inventaire
+export const MAX_INVENTORY = Number(process.env.MAX_INVENTORY) || 100; // Maximum shares par token
+export const MIN_INVENTORY_CLEANUP = Number(process.env.MIN_INVENTORY_CLEANUP) || 0.01; // Seuil de nettoyage
 
-// Paramètres Market Making
-export const TARGET_SPREAD_CENTS = Number(process.env.TARGET_SPREAD_CENTS || 2);
-export const TICK_IMPROVEMENT = Number(process.env.TICK_IMPROVEMENT || 1);
-export const NOTIONAL_PER_ORDER_USDC = Number(process.env.NOTIONAL_PER_ORDER_USDC || 2);
-export const BUDGET_GLOBAL_USDC = Number(process.env.BUDGET_GLOBAL_USDC || 50000);
-export const BUDGET_PER_MARKET_USDC = Number(process.env.BUDGET_PER_MARKET_USDC || 2000);
-export const MAX_ACTIVE_ORDERS = Number(process.env.MAX_ACTIVE_ORDERS || 8);
-export const REPLACE_COOLDOWN_MS = Number(process.env.REPLACE_COOLDOWN_MS || 1200);
-export const DRY_RUN = process.env.DRY_RUN === 'true';
+// Configuration des allowances
+export const ALLOWANCE_THRESHOLD_USDC = Number(process.env.ALLOWANCE_THRESHOLD_USDC) || 100; // Seuil minimum USDC
+export const ALLOWANCE_CHECK_COOLDOWN_MS = Number(process.env.ALLOWANCE_CHECK_COOLDOWN_MS) || 30000; // 30 secondes
 
-// Validation de base
-if (!PRIVATE_KEY || !API_KEY || !API_SECRET || !API_PASSPHRASE) {
-  throw new Error("❌ Identifiants API ou clé privée manquants dans .env. Veuillez configurer votre fichier .env.");
-}
+// Configuration du spread dynamique
+export const SPREAD_MULTIPLIER_LOW = Number(process.env.SPREAD_MULTIPLIER_LOW) || 0.5; // Multiplicateur pour spread serré
+export const SPREAD_MULTIPLIER_HIGH = Number(process.env.SPREAD_MULTIPLIER_HIGH) || 2.0; // Multiplicateur pour spread large
+export const MIN_SPREAD_MULTIPLIER = SPREAD_MULTIPLIER_LOW; // Alias pour compatibilité
+export const MAX_SPREAD_MULTIPLIER = SPREAD_MULTIPLIER_HIGH; // Alias pour compatibilité
 
-// Exporter un signataire pour la signature L1 (chaîne Polygon id 137 pour le mainnet)
-export const signerWallet = new Wallet(PRIVATE_KEY);
-export const POLYGON_CHAIN_ID = 137;
+// Configuration de la stratégie de parité
+export const PARITY_THRESHOLD = Number(process.env.PARITY_THRESHOLD) || 0.005; // Écart maximum Yes+No vs 1 pour déclencher l'arbitrage
+
+// Configuration des tailles
+export const MIN_SIZE_SHARES = Number(process.env.MIN_SIZE_SHARES) || 5; // Taille minimum en shares
+export const MIN_NOTIONAL_USDC = Number(process.env.MIN_NOTIONAL_USDC) || 1.0; // Notional minimum en USDC
+export const MIN_NOTIONAL_SELL_USDC = Number(process.env.MIN_NOTIONAL_SELL_USDC) || 1.0; // Notional minimum pour les SELL
+export const MAX_SELL_PER_ORDER_SHARES = Number(process.env.MAX_SELL_PER_ORDER_SHARES) || 50; // Maximum shares par ordre SELL
+
+// Configuration de l'inventaire par token
+export const MAX_INVENTORY_YES = Number(process.env.MAX_INVENTORY_YES) || 500; // Inventaire maximum pour YES
+export const MAX_INVENTORY_NO = Number(process.env.MAX_INVENTORY_NO) || 500; // Inventaire maximum pour NO
+
+// Configuration de la persistance
+export const INVENTORY_PERSISTENCE_FILE = process.env.INVENTORY_PERSISTENCE_FILE || '.inventory.json'; // Fichier de persistance
+
+// Configuration du notional adaptatif
+export const AUTO_ADJUST_NOTIONAL = process.env.AUTO_ADJUST_NOTIONAL === 'true'; // Ajustement automatique du notional selon le solde
+
+// Configuration de la réactivité aux mouvements de prix
+// PRICE_CHANGE_THRESHOLD déjà déclaré plus haut
+export const MAX_DISTANCE_FROM_MID = Number(process.env.MAX_DISTANCE_FROM_MID) || 0.05; // 5¢ - distance max du mid-price
+export const MAX_ACTIVE_MARKETS = Number(process.env.MAX_ACTIVE_MARKETS) || 1; // Nombre maximum de marchés actifs (SÉCURITÉ: 1)
+export const MIN_VOLUME_USDC = Number(process.env.MIN_VOLUME_USDC) || 5000; // Volume minimum 24h en USDC
+
+// Configuration du capital à risque
+export const MAX_NOTIONAL_AT_RISK_USDC = Number(process.env.MAX_NOTIONAL_AT_RISK_USDC) || 15.0; // Capital max exposé
+export const RECONCILE_INTERVAL_MS = Number(process.env.RECONCILE_INTERVAL_MS) || 60000; // 60s - intervalle de réconciliation
+
+// Configuration PnL et métriques
+export const PNL_PERSISTENCE_FILE = process.env.PNL_PERSISTENCE_FILE || '.pnl.json'; // Fichier de persistance PnL
+export const METRICS_LOG_INTERVAL_MS = Number(process.env.METRICS_LOG_INTERVAL_MS) || 60000; // 60s - intervalle de log métriques
+
+// Configuration WebSocket utilisateur
+export const WSS_USER_URL = process.env.WSS_USER_URL || "wss://ws-subscriptions-clob.polymarket.com/ws/user"; // WebSocket fills
+
+// Configuration du skew d'inventaire
+export const INVENTORY_SKEW_LAMBDA = Number(process.env.INVENTORY_SKEW_LAMBDA) || 0.002; // 0.2% par 100 shares

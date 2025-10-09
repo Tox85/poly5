@@ -1,43 +1,86 @@
 // src/ws/marketFeed.ts
 import WebSocket from "ws";
-import pino from "pino";
+import { rootLog } from "../index";
+import { WSS_URL } from "../config";
 
-const log = pino({ name: "ws" });
-const WSS = process.env.WSS_URL || "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+const log = rootLog.child({ name: "ws" });
 
 type PriceUpdate = { asset_id:string; best_bid?:string; best_ask?:string };
 
 export class MarketFeed {
   private ws?: WebSocket;
   private ping?: NodeJS.Timeout;
+  private reconnectTimeout?: NodeJS.Timeout;
   private listeners = new Map<string, (bb:number|null, ba:number|null)=>void>();
   // Cache des dernières valeurs price_change (source de vérité)
   private lastPrices = new Map<string, {bestBid: number|null, bestAsk: number|null}>();
+  // Anti-spam pour les logs de prix
+  private lastPriceLogs = new Map<string, {bid: number|null, ask: number|null}>();
+  private currentTokenIds: string[] = [];
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private isConnecting = false;
 
   subscribe(tokenIds: string[], onUpdate: (tokenId:string, bb:number|null, ba:number|null)=>void) {
     tokenIds.forEach(t => this.listeners.set(t, (bb,ba)=>onUpdate(t,bb,ba)));
+    this.currentTokenIds = tokenIds;
     this.connect(tokenIds);
+  }
+  
+  getLastPrices(tokenId: string): { bestBid: number|null, bestAsk: number|null } | null {
+    return this.lastPrices.get(tokenId) || null;
   }
 
   private connect(tokenIds: string[]) {
-    this.ws = new WebSocket(WSS);
+    if (this.isConnecting) {
+      log.debug("Connection already in progress, skipping");
+      return;
+    }
+
+    this.isConnecting = true;
+    this.reconnectAttempts++;
+
+    // Nettoyer les timeouts précédents
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = undefined;
+    }
+
+    log.info({ 
+      attempt: this.reconnectAttempts, 
+      maxAttempts: this.maxReconnectAttempts,
+      url: WSS_URL 
+    }, "Attempting WebSocket connection");
+
+    this.ws = new WebSocket(WSS_URL);
+    
     this.ws.on("open", () => {
+      this.isConnecting = false;
+      this.reconnectAttempts = 0; // Reset counter on successful connection
+      
       // Attendre un peu que la connexion soit complètement établie
       setTimeout(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
           // Format de souscription qui fonctionne selon nos tests
           const sub = { type: "MARKET", assets_ids: tokenIds };
           this.ws.send(JSON.stringify(sub));
+          
           this.ping = setInterval(()=> {
             if (this.ws?.readyState === WebSocket.OPEN) {
-              this.ws.send("PING");
+              this.ws.ping();
             }
           }, 10_000);
+          
           log.info({ tokenIds }, "WSS connected & subscribed");
         }
       }, 100);
     });
-      this.ws.on("message", (buf) => {
+
+    this.ws.on("pong", () => {
+      // Pong reçu, connexion OK
+    });
+
+    this.ws.on("message", (buf) => {
         try {
           const data = buf.toString();
           
@@ -59,38 +102,121 @@ export class MarketFeed {
               
               // Notifier les listeners
               this.listeners.get(pc.asset_id)?.(bb,ba);
-              log.info({ asset_id: pc.asset_id, best_bid: bb, best_ask: ba }, "price update");
+              
+              // Log seulement si le prix a changé (anti-spam)
+              const prev = this.lastPriceLogs.get(pc.asset_id);
+              if (!prev || prev.bid !== bb || prev.ask !== ba) {
+                log.debug({ asset_id: pc.asset_id, best_bid: bb, best_ask: ba }, "price update");
+                this.lastPriceLogs.set(pc.asset_id, { bid: bb, ask: ba });
+              }
             }
           } else if (msg.event_type === "book") {
             const asset = msg.asset_id;
-            // Le book sert seulement pour snapshot/resync, pas pour remplacer price_change
             const bb = msg.bids?.length ? Number(msg.bids[0].price) : null;
             const ba = msg.asks?.length ? Number(msg.asks[0].price) : null;
             
-            // Seulement mettre à jour le cache si on a de vraies données
-            if (bb !== null || ba !== null) {
+            // FILTRE CRITIQUE: Ignorer les données book corrompues
+            // Les données book avec bid=0.001 et ask=0.999 sont des valeurs par défaut incorrectes
+            const isCorruptedData = (bb === 0.001 && ba === 0.999) || 
+                                   (bb === 0.001 && ba === null) || 
+                                   (bb === null && ba === 0.999);
+            
+            if (isCorruptedData) {
+              log.warn({ 
+                asset_id: asset, 
+                best_bid: bb, 
+                best_ask: ba, 
+                reason: "Corrupted book data detected" 
+              }, "Ignoring corrupted book snapshot");
+              return;
+            }
+            
+            // Seulement utiliser les données book si elles semblent valides
+            if (bb !== null && ba !== null && bb < ba && bb > 0 && ba < 1) {
               const current = this.lastPrices.get(asset) || { bestBid: null, bestAsk: null };
               this.lastPrices.set(asset, { 
-                bestBid: bb !== null ? bb : current.bestBid, 
-                bestAsk: ba !== null ? ba : current.bestAsk 
+                bestBid: bb, 
+                bestAsk: ba 
               });
               
-              // Utiliser les valeurs mises à jour (book + cache price_change)
-              const finalBid = bb !== null ? bb : current.bestBid;
-              const finalAsk = ba !== null ? ba : current.bestAsk;
-              
-              this.listeners.get(asset)?.(finalBid, finalAsk);
-              log.info({ asset_id: asset, best_bid: finalBid, best_ask: finalAsk, source: "book+cache" }, "book snapshot");
+              this.listeners.get(asset)?.(bb, ba);
+              log.info({ asset_id: asset, best_bid: bb, best_ask: ba, source: "book+validated" }, "book snapshot");
+            } else {
+              log.debug({ 
+                asset_id: asset, 
+                best_bid: bb, 
+                best_ask: ba, 
+                reason: "Invalid book data (bb >= ba or out of range)" 
+              }, "Ignoring invalid book snapshot");
             }
           }
         } catch(e) { 
           log.warn({ e, data: buf.toString().substring(0, 100) }, "WS parse error"); 
         }
       });
-    this.ws.on("close", () => {
+    this.ws.on("close", (code, reason) => {
+      this.isConnecting = false;
       clearInterval(this.ping!);
-      setTimeout(()=> this.connect(tokenIds), Number(process.env.WS_RECONNECT_MS || 2000));
+      
+      log.warn({ 
+        code, 
+        reason: reason.toString(),
+        attempt: this.reconnectAttempts,
+        maxAttempts: this.maxReconnectAttempts
+      }, "WebSocket connection closed");
+
+      // Reconnexion avec backoff exponentiel
+      if (this.reconnectAttempts < this.maxReconnectAttempts) {
+        const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
+        log.info({ delay, attempt: this.reconnectAttempts }, "Scheduling reconnection");
+        
+        this.reconnectTimeout = setTimeout(() => {
+          this.connect(this.currentTokenIds);
+        }, delay);
+      } else {
+        log.error({ maxAttempts: this.maxReconnectAttempts }, "Max reconnection attempts reached");
+      }
     });
-    this.ws.on("error", (err)=> log.error({ err }, "WSS error"));
+    
+    this.ws.on("error", (err) => {
+      this.isConnecting = false;
+      log.error({ 
+        err: {
+          type: err.constructor.name,
+          message: err.message,
+          errno: (err as any).errno,
+          code: (err as any).code,
+          syscall: (err as any).syscall,
+          hostname: (err as any).hostname
+        }
+      }, "WSS error");
+    });
+  }
+
+  /**
+   * Ferme proprement la connexion WebSocket
+   */
+  disconnect() {
+    log.info("Disconnecting WebSocket...");
+    
+    // Nettoyer tous les timeouts
+    if (this.ping) {
+      clearInterval(this.ping);
+      this.ping = undefined;
+    }
+    
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = undefined;
+    }
+    
+    // Fermer la connexion WebSocket
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.close(1000, "Normal closure");
+    }
+    
+    this.isConnecting = false;
+    this.reconnectAttempts = 0;
+    log.info("WebSocket disconnected");
   }
 }

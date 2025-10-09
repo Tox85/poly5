@@ -11,6 +11,15 @@
     "create:clobkey": "ts-node scripts/create-clob-key.ts",
     "test:custom": "ts-node scripts/test-custom-clob.ts",
     "test:auth": "ts-node scripts/test-auth.ts",
+    "test:full-auth": "ts-node scripts/test-full-auth.ts",
+    "close-orders": "ts-node scripts/close-orders.ts",
+    "close-orders:dry": "ts-node scripts/close-orders.ts --dry-run",
+    "test:features": "ts-node scripts/test-new-features.ts",
+    "status": "ts-node scripts/status.ts",
+    "cleanup": "ts-node scripts/cleanup.ts",
+    "sync-inventory": "ts-node scripts/sync-inventory.ts",
+    "test-market-maker": "ts-node scripts/test-market-maker.ts",
+    "test-websocket": "ts-node scripts/test-websocket.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
@@ -22,6 +31,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@ethersproject/providers": "^5.8.0",
+    "@ethersproject/wallet": "^5.8.0",
+    "@polymarket/clob-client": "^4.22.3",
+    "@polymarket/order-utils": "^2.1.0",
     "@polymarket/real-time-data-client": "^1.4.0",
     "axios": "^1.12.2",
     "dotenv": "^17.2.3",
