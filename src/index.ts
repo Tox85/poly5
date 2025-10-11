@@ -3,7 +3,10 @@ import "dotenv/config";
 import pino from "pino";
 import { LOG_LEVEL } from "./config";
 
-// Validation des variables d'environnement critiques
+// Validation stricte avec Zod (optionnelle, activée via USE_ZOD_VALIDATION=true)
+// Sera appelée dans main() pour éviter top-level await
+
+// Validation basique (toujours active pour rétrocompatibilité)
 const REQUIRED = [
   "PRIVATE_KEY",
   "CLOB_API_KEY", 
@@ -27,9 +30,9 @@ export const rootLog = pino({
   timestamp: pino.stdTimeFunctions.isoTime,
 });
 import { discoverLiveClobMarkets } from "./data/discovery";
-import { snapshotTop } from "./data/book";
+// import { snapshotTop } from "./data/book"; // UNUSED - Removed
 import { MarketMaker, MarketMakerConfig } from "./marketMaker";
-import { ensureUsdcAllowance } from "./utils/approve";
+// import { ensureUsdcAllowance } from "./utils/approve"; // UNUSED - Removed
 import { 
   TARGET_SPREAD_CENTS, 
   TICK_IMPROVEMENT, 
@@ -55,6 +58,12 @@ import {
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
 
 async function main() {
+  // Validation Zod optionnelle (fail-fast)
+  if (process.env.USE_ZOD_VALIDATION === 'true') {
+    const { parseEnv } = await import("./config/schema");
+    parseEnv(process.env);
+  }
+  
   const MIN_VOL = MIN_VOLUME_USDC; // Utiliser la config centralisée
   const MAX = MAX_ACTIVE_MARKETS; // Utiliser la config centralisée
 
@@ -228,15 +237,27 @@ async function main() {
     config: mmConfig 
   }, "✅ Market makers en cours de démarrage");
 
-  // Gestion propre de l'arrêt
+  // Gestion propre de l'arrêt (SIGINT = Ctrl+C local)
   process.on('SIGINT', async () => {
-    log.info("🛑 Arrêt demandé, nettoyage en cours...");
+    log.info("🛑 SIGINT reçu, arrêt demandé, nettoyage en cours...");
     
     for (const mm of marketMakers) {
       await mm.stop();
     }
     
     log.info("👋 Bot arrêté proprement");
+    process.exit(0);
+  });
+
+  // Gestion arrêt gracieux Railway/Docker (SIGTERM)
+  process.on('SIGTERM', async () => {
+    log.info("🛑 SIGTERM reçu (Railway/Docker shutdown), arrêt gracieux en cours...");
+    
+    for (const mm of marketMakers) {
+      await mm.stop();
+    }
+    
+    log.info("👋 Bot arrêté proprement (graceful shutdown)");
     process.exit(0);
   });
 }

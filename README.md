@@ -1,277 +1,317 @@
-# 🤖 Bot de Market Making Polymarket
+# 🤖 Polymarket Market Making Bot
 
-Bot de market making automatisé pour la plateforme Polymarket, écrit en TypeScript. Le bot place des ordres d'achat et de vente pour capturer le spread sur les marchés de prédiction.
+Bot de market making automatisé pour Polymarket utilisant le SDK officiel.
 
-## ✨ Fonctionnalités
+---
 
-- 🎯 **Market making automatisé** sur les marchés Polymarket les plus liquides
-- 📊 **Détection temps réel** via WebSocket des variations de prix
-- 💰 **Gestion intelligente** du capital et de l'inventaire
-- 🔄 **Ajustement dynamique** des prix selon les conditions du marché
-- 📈 **Filtrage intelligent** des marchés par volume et spread
-- ⚡ **Réactivité** : Remplace les ordres si mouvement de prix >0.1¢
-- 🛡️ **Sécurité** : Vérifications on-chain et gestion des limites
+## 🚀 Démarrage Rapide
 
-## 🚀 Installation
+### 1. Installation
 
 ```bash
-# Installer les dépendances
 npm install
+```
 
-# Copier le fichier d'exemple d'environnement
+### 2. Configuration
+
+Copiez `.env.example` vers `.env` et remplissez vos credentials :
+
+```bash
 cp env.example .env
-
-# Éditer .env avec vos credentials
-nano .env
 ```
 
-## ⚙️ Configuration
+### Variables OBLIGATOIRES (5) :
+- `PRIVATE_KEY` - Clé privée de votre EOA (format: 0x + 64 hex)
+- `CLOB_API_KEY` - Clé API CLOB Polymarket (UUID)
+- `CLOB_API_SECRET` - Secret API CLOB (string hex)
+- `CLOB_PASSPHRASE` - Passphrase API CLOB (string hex)
+- `POLY_PROXY_ADDRESS` - Adresse de votre proxy Polymarket (0x + 40 hex)
 
-### Variables d'environnement requises
+### Variables RECOMMANDÉES (config optimale) :
+- `MIN_VOLUME_USDC=50000` - Volume minimum 24h
+- `MIN_SPREAD_CENTS=4` - Spread minimum (4¢ = rentable)
+- `MAX_SPREAD_CENTS=10` - Spread maximum
+- `TARGET_SPREAD_CENTS=4` - Spread cible
+- `TICK_IMPROVEMENT=1` - Amélioration de prix (priorité de file) ⚡
+- `NOTIONAL_PER_ORDER_USDC=1.5` - Montant par ordre
+- `MAX_ACTIVE_MARKETS=2` - Nombre de marchés
 
-Copiez `env.example` vers `.env` et configurez :
+**Toutes les autres variables (33)** ont des valeurs par défaut intelligentes.  
+Voir `env.example` pour la liste complète des 44 variables disponibles.
 
-```env
-# Identifiants API et Wallet Polymarket
-PRIVATE_KEY=votre_cle_privee_polygon
-CLOB_API_KEY=votre_api_key_polymarket
-CLOB_API_SECRET=votre_api_secret
-CLOB_PASSPHRASE=votre_passphrase
-POLY_PROXY_ADDRESS=votre_adresse_proxy
-
-# Paramètres du bot
-DRY_RUN=false                      # true pour tester sans ordres réels
-MAX_ACTIVE_MARKETS=2               # Nombre de marchés à trader
-NOTIONAL_PER_ORDER_USDC=1.5        # Montant USDC par ordre
-TARGET_SPREAD_CENTS=3              # Spread cible en centimes
-MIN_VOLUME_USDC=5000               # Volume minimum 24h requis
-
-# Limites d'inventaire
-MAX_INVENTORY_YES=500              # Maximum shares YES par token
-MAX_INVENTORY_NO=500               # Maximum shares NO par token
-
-# Adaptation automatique
-AUTO_ADJUST_NOTIONAL=true          # Ajuster le notional selon le solde
-PRICE_CHANGE_THRESHOLD=0.001       # Seuil de mouvement (0.1¢)
-MAX_DISTANCE_FROM_MID=0.05         # Distance max du mid-price (5¢)
-```
-
-## 📝 Utilisation
-
-### Démarrage du bot
+### 3. Lancer le Bot
 
 ```bash
 npm start
 ```
 
-### Mode développement (avec rechargement)
+---
 
-```bash
-npm run dev
-```
+## 📊 Configuration
 
-### Scripts utiles
+Principales variables (voir `env.example` pour la liste complète) :
 
-```bash
-# Compiler TypeScript
-npm run build
+### Marchés
+- `MIN_VOLUME_USDC` - Volume minimum 24h (défaut: 50000)
+- `MIN_SPREAD_CENTS` - Spread minimum requis (défaut: 3)
+- `MAX_SPREAD_CENTS` - Spread maximum accepté (défaut: 10)
+- `MAX_ACTIVE_MARKETS` - Nombre de marchés actifs (défaut: 2)
 
-# Tester l'authentification
-npm run test:auth
+### Ordres
+- `TARGET_SPREAD_CENTS` - Spread cible pour ordres (défaut: 4)
+- `NOTIONAL_PER_ORDER_USDC` - Montant par ordre (défaut: 1.5)
+- `MAX_INVENTORY` - Inventaire maximum par token (défaut: 500)
 
-# Voir les ordres ouverts
-npx tsx scripts/test-auth.ts
+### Sécurité
+- `DRY_RUN` - Mode test sans ordres réels (défaut: false)
 
-# Synchroniser l'inventaire
-npx tsx scripts/sync-inventory.ts
+---
 
-# Fermer tous les ordres
-npm run close-orders
-
-# Mode simulation (sans fermer)
-npm run close-orders:dry
-```
-
-## 🎯 Stratégie de Trading
-
-Le bot implémente une stratégie de market making sophistiquée :
-
-### 1. **Sélection des marchés**
-- Scan de tous les marchés Gamma actifs
-- Filtre par volume minimum (défaut : 5000 USDC/24h)
-- Priorité aux marchés spécifiques (ex: Trump Nobel)
-- Limite au nombre configuré (défaut : 2 marchés)
-
-### 2. **Détection temps réel**
-- WebSocket pour mises à jour instantanées best bid/ask
-- Calcul du mid-price actuel
-- Détection des mouvements >0.1¢
-- Remplacement automatique des ordres
-
-### 3. **Calcul des prix**
-- **Bid** : Exactement au best bid (ou +1 tick)
-- **Ask** : Exactement au best ask (ou -1 tick)
-- **Protection** : Distance max 5¢ du mid-price
-- **Validation** : Vérification cross-the-book
-
-### 4. **Calcul des tailles**
-- **BUY** : Adapté au capital disponible
-- **SELL** : Arrondi vers le bas (floor), limité par inventaire
-- **Minimum** : 5 shares (exigence Polymarket)
-- **Auto-ajustement** : Augmentation du notional pour prix élevés
-
-### 5. **Vérifications de solvabilité**
-- **USDC** : Balance et allowance vérifiées à chaque ordre
-- **Tokens ERC-1155** : Vérification inventaire on-chain
-- **Mise à jour auto** : Synchronisation après chaque trade
-
-### 6. **Gestion des risques**
-- Limites d'inventaire par token (YES/NO)
-- Réserve de capital (10% ou 0.5 USDC min)
-- Skip si spread trop serré ou capital insuffisant
-- Annulation si conditions non remplies
-
-## 📊 Architecture
+## 🏗️ Architecture
 
 ```
 src/
-├── index.ts              # Point d'entrée principal
-├── config.ts             # Configuration centralisée
-├── marketMaker.ts        # Logique de market making
-├── inventory.ts          # Gestion de l'inventaire
-├── allowanceManager.ts   # Gestion des allowances
-├── closeOrders.ts        # Fermeture d'ordres
-├── clients/
-│   ├── customClob.ts     # Client CLOB personnalisé
-│   └── gamma.ts          # Client API Gamma
-├── data/
-│   ├── book.ts           # Carnets d'ordres
-│   └── discovery.ts      # Découverte de marchés
-├── ws/
-│   └── marketFeed.ts     # WebSocket temps réel
-├── risk/
-│   ├── sizing.ts         # Calcul des tailles
-│   └── solvency.ts       # Vérifications de solvabilité
-└── lib/
-    ├── amounts.ts        # Quantification des montants
-    └── erc1155.ts        # Interactions ERC-1155
+├── index.ts              # Point d'entrée
+├── marketMaker.ts        # Logique principale de market making
+├── config.ts             # Configuration centralisée (44 variables)
+│
+├── clients/              # Clients API
+│   ├── polySDK.ts        # SDK Polymarket officiel
+│   └── gamma.ts          # API Gamma (discovery)
+│
+├── config/               # Configuration avancée
+│   └── schema.ts         # Validation Zod (optionnel)
+│
+├── ws/                   # WebSocket temps réel
+│   ├── marketFeed.ts     # Prix en temps réel (market channel)
+│   └── userFeed.ts       # Fills en temps réel (user channel)
+│
+├── data/                 # Découverte & order books
+│   ├── discovery.ts      # Découverte des marchés
+│   └── book.ts           # Snapshots des carnets d'ordres
+│
+├── risk/                 # Gestion des risques
+│   ├── solvency.ts       # Vérifications USDC/balance
+│   └── sizing.ts         # Calcul tailles d'ordres
+│
+├── lib/                  # Bibliothèques utilitaires
+│   ├── quote-guard.ts    # Protection post-only + tick improvement ⚡
+│   ├── math.ts           # Fonctions mathématiques (canon)
+│   ├── amounts.ts        # Quantisation Polymarket
+│   ├── round.ts          # Arrondis précis
+│   └── erc1155.ts        # Lecture balances ERC-1155
+│
+├── inventory.ts          # Gestion inventaire YES/NO
+├── allowanceManager.ts   # Gestion allowances USDC
+├── closeOrders.ts        # Fermeture des ordres
+│
+└── metrics/
+    └── pnl.ts            # Tracking PnL et métriques
 ```
 
-## 🔍 Monitoring
+---
 
-Le bot génère des logs détaillés au format JSON :
+## 🔧 Scripts Disponibles
 
-- 🚀 Démarrage et connexions
-- 📊 Découverte et sélection des marchés
-- 💰 Vérifications USDC et allowances
-- 📦 Synchronisation de l'inventaire
-- 🔌 Connexion WebSocket et prix temps réel
-- ✅ Placement d'ordres (succès)
-- ❌ Erreurs et avertissements
-- ⚡ Détection de mouvements de prix
-
-### Exemples de logs
-
-**Ordre placé avec succès :**
-```json
-{
-  "level": 30,
-  "msg": "✅ BUY order placed successfully",
-  "bidId": "0xacc0457a...",
-  "bidPrice": "0.0640",
-  "size": 23.44,
-  "newInventory": 171.38
-}
-```
-
-**Ajustement automatique du notional :**
-```json
-{
-  "level": 20,
-  "msg": "📊 Notional increased to meet minimum shares requirement",
-  "price": "0.9340",
-  "minShares": 5,
-  "oldNotional": "1.50",
-  "newNotional": "4.67"
-}
-```
-
-## ⚠️ Sécurité et Avertissements
-
-### ✅ Bonnes pratiques
-
-- Ne **jamais** committer le fichier `.env`
-- Garder vos clés privées **sécurisées**
-- Commencer avec `DRY_RUN=true` pour tester
-- Utiliser de **petits montants** au début
-- **Surveiller** le bot régulièrement
-- Définir des **limites strictes** d'inventaire
-
-### ⚠️ Risques
-
-- Le market making comporte des risques de perte
-- Les prix peuvent évoluer rapidement
-- L'inventaire peut devenir déséquilibré
-- Les frais de transaction s'accumulent
-- La liquidité peut varier selon les marchés
-
-### 🛡️ Protections intégrées
-
-- ✅ Vérification on-chain avant chaque SELL
-- ✅ Réserve de capital pour éviter le blocage
-- ✅ Limites d'inventaire configurables
-- ✅ Filtrage des données corrompues (WebSocket)
-- ✅ Gestion automatique des erreurs
-- ✅ Arrêt propre avec fermeture des ordres
-
-## 🐛 Résolution de problèmes
-
-### Problème : "Size lower than the minimum: 5"
-
-**Solution :** Le bot ajuste maintenant automatiquement le notional pour respecter le minimum de 5 shares. Si l'erreur persiste, augmentez `NOTIONAL_PER_ORDER_USDC`.
-
-### Problème : "not enough USDC balance"
-
-**Solutions :**
-1. Activez `AUTO_ADJUST_NOTIONAL=true`
-2. Réduisez `NOTIONAL_PER_ORDER_USDC`
-3. Vérifiez votre solde : `npx tsx scripts/check-real-balance.ts`
-4. Déposez plus d'USDC sur votre proxy
-
-### Problème : "WebSocket disconnected"
-
-**Solution :** Le bot reconnecte automatiquement avec backoff exponentiel (jusqu'à 10 tentatives).
-
-### Problème : Inventaire désynchronisé
-
-**Solution :**
 ```bash
-# Synchroniser depuis la blockchain
-npx tsx scripts/sync-real-inventory.ts
+npm start              # Lancer le bot
+npm run build          # Compiler TypeScript
+npm run dev            # Mode développement (hot reload)
 
-# Ou réinitialiser complètement
-npx tsx scripts/reset-inventory.ts
+npm run check-balances # Vérifier balances USDC
+npm run find-proxy     # Trouver adresse proxy
+npm run test-poly-sdk  # Tester SDK Polymarket
+npm run test-websocket # Tester WebSocket
 ```
 
-## 📈 Performance
+---
 
-- ⚡ **Réactivité** : <1 seconde pour détecter et réagir aux mouvements
-- 🎯 **Précision** : 100% de respect des contraintes Polymarket
-- 💰 **Capital efficient** : Ajustement automatique selon le solde
-- 🔄 **Fiabilité** : Reconnexion automatique et gestion d'erreurs
+## 📈 Flux de Fonctionnement
 
-## 📚 Documentation API
+### Au Démarrage
+1. **Validation** - Vérification configuration .env
+2. **Découverte** - Analyse 8000+ marchés Polymarket (API Gamma)
+3. **Filtrage** - Volume >50K$ + spread 4-10¢ (configurable)
+4. **Scoring** - Classement par volume + spread
+5. **Sélection** - Top 2 marchés les plus opportuns
+6. **Init USDC** - Vérification balance/allowance
+7. **Sync Inventaire** - Lecture positions blockchain
+8. **Récupération Ordres** - Charge ordres déjà ouverts (nouveau!)
+9. **WebSocket** - Connexion feeds market + user
 
-- [Documentation Polymarket](https://docs.polymarket.com)
-- [API CLOB](https://docs.polymarket.com/api/clob)
-- [Gamma Markets](https://gamma-api.polymarket.com)
+### En Continu
+1. **Prix Update** - Réception prix temps réel (WebSocket)
+2. **Quote Guards** - Calcul prix avec tick improvement (+1 tick)
+3. **Validation** - Vérification post-only (pas de cross)
+4. **Placement** - Ordres BUY/SELL avec logs forensics
+5. **Fills** - Mise à jour inventaire en temps réel
+6. **Replacement** - Si prix bouge/pas compétitif/TTL
 
-## 📄 Licence
+### Toutes les 60s
+- **Réconciliation ordres** - Compare cache ↔ API REST
+- **Métriques PnL** - Log des performances
+
+### Toutes les 2min
+- **Sync inventaire** - Compare local ↔ blockchain
+- **Détection divergences** - Correction automatique
+
+---
+
+## ⚙️ Fonctionnalités
+
+### ✅ Market Making Intelligent
+- Placement automatique d'ordres BUY/SELL
+- **Quote Guards** : Protection post-only + amélioration de prix ⚡
+- **Tick Improvement** : Améliore le prix de 1 tick (priorité de file)
+- Spread dynamique adaptatif
+- Replacement automatique (prix bougé, pas compétitif, TTL)
+- Stratégie de parité YES/NO
+
+### ✅ Réconciliation Robuste
+- **Ordres** : Sync API REST toutes les 60s (détecte ordres annulés/remplis)
+- **Inventaire** : Sync blockchain toutes les 2min (source de vérité)
+- **Détection divergences** : Logs automatiques des incohérences
+- **Recovery** : Charge ordres existants au démarrage
+
+### ✅ Gestion des Risques
+- Vérifications de solvabilité avant chaque ordre
+- Limites d'inventaire configurables (MAX_INVENTORY_YES/NO)
+- Capital à risque plafonné (MAX_NOTIONAL_AT_RISK_USDC)
+- Protection contre marchés inactifs (health check 3min)
+- Validation des prix (distance du mid, cross-the-book)
+
+### ✅ WebSocket Temps Réel
+- **Market Feed** : Prix bid/ask en temps réel
+- **User Feed** : Fills et ordres en temps réel
+- Reconnexion automatique avec backoff exponentiel
+- Détection des WebSocket gelés (watchdog)
+
+### ✅ Métriques & Monitoring
+- PnL en temps réel avec persistence
+- Logs structurés JSON (pino)
+- Tracking complet des trades
+- Logs forensics pour debugging (event: place_attempt, order_ack, fill)
+
+---
+
+## 🛡️ Sécurité
+
+### Authentification
+- Signature EIP-712 pour ordres
+- HMAC-SHA256 pour API REST
+- Support proxy Polymarket (signatureType: 2)
+
+### Validation
+- Vérification des variables d'environnement au démarrage
+- Validation optionnelle avec Zod (`USE_ZOD_VALIDATION=true`)
+- Quantisation stricte (2 dec shares, 5 dec notional)
+
+---
+
+## 📊 Dépendances
+
+### Production
+- `@polymarket/clob-client` - SDK officiel Polymarket CLOB
+- `@polymarket/order-utils` - Signature EIP-712 et types
+- `ethers` - Interactions blockchain (RPC Polygon)
+- `axios` - Client HTTP REST
+- `dotenv` - Variables d'environnement
+- `pino` - Logging JSON structuré haute performance
+- `ws` - Client WebSocket temps réel
+
+### Développement
+- `typescript` - Compilateur TypeScript
+- `ts-node` - Exécution directe TypeScript
+- `@types/node` - Types Node.js
+- `@types/ws` - Types WebSocket
+- `zod` - Validation runtime optionnelle (USE_ZOD_VALIDATION=true)
+
+---
+
+## 📝 Fichiers Importants
+
+- `.env` - Configuration secrète (**ne pas versionner**)
+- `.inventory.json` - État de l'inventaire (généré automatiquement)
+- `package.json` - Configuration npm
+- `tsconfig.json` - Configuration TypeScript
+- `env.example` - Template de configuration
+
+---
+
+## ⚠️ Notes
+
+### Fonds Requis
+- Minimum recommandé : **$50-100 USDC** sur le proxy
+- Ajuster `NOTIONAL_PER_ORDER_USDC` selon vos fonds
+
+### Rate Limiting
+- Polymarket limite à ~10 req/sec
+- Le bot utilise WebSocket pour minimiser les appels API
+- Cooldown de replacement : 1.5s minimum
+
+### Marchés
+- Le bot sélectionne automatiquement les meilleurs marchés
+- **Critères** : volume > 50K$ USDC, spread 4-10¢
+- **Health check** : Toutes les 3 minutes (arrêt si inactif >5min)
+- **Filtrage intelligent** : Exclut marchés fermés/résolus
+
+### Tick Improvement (Nouveau ⚡)
+- **TICK_IMPROVEMENT=1** : Améliore le prix de 1 tick (0.1¢)
+- **Priorité de file** : Vos ordres passent AVANT les autres au même prix
+- **Plus de fills** : Meilleure position dans le carnet d'ordres
+- **Configurable** : 0=join-only, 1=recommandé, 2+=agressif
+
+---
+
+## 🎯 Support
+
+Pour des questions ou des problèmes :
+1. Vérifiez votre configuration `.env`
+2. Vérifiez vos balances : `npm run check-balances`
+3. Testez le SDK : `npm run test-poly-sdk`
+4. Testez WebSocket : `npm run test-websocket`
+
+---
+
+## 📄 License
 
 ISC
 
 ---
 
-**⚠️ Disclaimer :** Ce bot est fourni à des fins éducatives. Utilisez-le à vos propres risques. Les auteurs ne sont pas responsables des pertes financières.
+**Version** : 1.0.0  
+**Dernière mise à jour** : 2025-10-12  
+**Statut** : ✅ Production-ready  
 
-**🎉 Bot opérationnel et testé !** Dernière mise à jour : Octobre 2025
+---
+
+## 🎯 Nouvelles Fonctionnalités (v1.0.0)
+
+### ⚡ Quote Guards & Tick Improvement
+- Protection post-only émulée (pas d'ordres marketables)
+- Amélioration automatique de 1 tick (priorité de file)
+- Validation robuste des prix (distance mid, cross-the-book)
+- Logs forensics complets pour debugging
+
+### 🔄 Réconciliation Robuste
+- Récupération ordres existants au démarrage
+- Sync API REST toutes les 60s (source de vérité)
+- Sync blockchain toutes les 2min (inventaire réel)
+- Détection automatique des divergences
+
+### 📊 Filtrage des Marchés Amélioré
+- **MIN_SPREAD_CENTS** : Exclut marchés trop serrés (<4¢)
+- **MAX_SPREAD_CENTS** : Exclut marchés trop larges (>10¢)
+- **MIN_VOLUME_USDC** : Seulement marchés liquides (>50K$)
+
+---
+
+## 📁 Structure du Projet Nettoyée
+
+Fichiers essentiels uniquement :
+- **20 fichiers TypeScript** dans `src/`
+- **7 répertoires** bien organisés
+- **5 scripts utilitaires** dans `scripts/`
+- **0 fichier inutile** - Projet clean ✨
+
+Pour voir la structure complète : `PROJECT-STRUCTURE.md`

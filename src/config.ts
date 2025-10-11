@@ -16,7 +16,7 @@ export const PLACE_EVERY_MS = 1500; // Anti-spam pour les logs
 
 // Configuration du bot (depuis .env)
 export const TARGET_SPREAD_CENTS = Number(process.env.TARGET_SPREAD_CENTS) || 3; // Augmenté à 3¢ pour rentabilité
-export const TICK_IMPROVEMENT = Number(process.env.TICK_IMPROVEMENT) || 0; // 0 = exactement au best bid/ask
+export const TICK_IMPROVEMENT = Number(process.env.TICK_IMPROVEMENT) || 1; // 1 tick = 0.1¢ d'amélioration (priorité de file)
 export const NOTIONAL_PER_ORDER_USDC = Number(process.env.NOTIONAL_PER_ORDER_USDC) || 1.5; // Réduit à 1.5$ pour économiser le capital
 export const MAX_ACTIVE_ORDERS = Number(process.env.MAX_ACTIVE_ORDERS) || 100;
 export const REPLACE_COOLDOWN_MS = Number(process.env.REPLACE_COOLDOWN_MS) || 1500;

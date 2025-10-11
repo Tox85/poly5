@@ -1,6 +1,7 @@
 // src/data/discovery.ts
 import pino from "pino";
-import { fetchAllOpenTradableMarkets, GammaMarket } from "../clients/gamma";
+import { fetchAllOpenTradableMarkets } from "../clients/gamma";
+// GammaMarket type - UNUSED (removed, type inferred)
 // Plus besoin de CustomClobClient - on utilise uniquement l'API Gamma
 
 const log = pino({ name: "discovery" });

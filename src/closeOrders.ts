@@ -2,7 +2,8 @@
 import pino from "pino";
 import { PolyClobClient } from "./clients/polySDK";
 import { JsonRpcProvider } from "ethers";
-import { RPC_URL, POLY_PROXY_ADDRESS } from "./config";
+import { RPC_URL } from "./config";
+// POLY_PROXY_ADDRESS - UNUSED (removed)
 
 const log = pino({ name: "close-orders" });
 

@@ -1,7 +1,8 @@
 // src/inventory.ts - Gestion de l'inventaire des tokens (shares)
 import pino from "pino";
 import { JsonRpcProvider } from "ethers";
-import { MIN_INVENTORY_CLEANUP, INVENTORY_PERSISTENCE_FILE, MAX_INVENTORY_YES, MAX_INVENTORY_NO } from "./config";
+import { MIN_INVENTORY_CLEANUP, INVENTORY_PERSISTENCE_FILE } from "./config";
+// MAX_INVENTORY_YES, MAX_INVENTORY_NO - UNUSED (removed, managed in marketMaker.ts)
 import fs from "fs/promises";
 
 const log = pino({ name: "inventory" });
