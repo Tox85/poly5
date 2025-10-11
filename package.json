@@ -7,6 +7,15 @@
     "start": "ts-node src/index.ts",
     "build": "tsc",
     "dev": "ts-node --watch src/index.ts",
+    "smoke": "node scripts/smoke.js",
+    "audit:graph": "madge --ts-config tsconfig.json --extensions ts,tsx --circular --json src > .audit/madge.json || echo \"Madge completed\"",
+    "audit:knip": "knip --reporter=json --no-gitignore > .audit/knip.json || echo \"Knip completed\"",
+    "audit:prune": "ts-prune -p tsconfig.json --ignore \"**/*.spec.ts\" > .audit/ts-prune.txt || echo \"ts-prune completed\"",
+    "audit:deps": "depcheck --json > .audit/depcheck.json || echo \"depcheck completed\"",
+    "audit:cov": "c8 --reporter=json node scripts/smoke.js",
+    "audit:trace": "node -r ./scripts/trace-imports.js",
+    "audit:keep": "ts-node tools/build-keep-list.ts",
+    "audit:all": "mkdir -p .audit && npm run build && npm run audit:graph && npm run audit:knip && npm run audit:prune && npm run audit:deps && npm run audit:cov",
     "whoami": "ts-node scripts/whoami.ts",
     "create:clobkey": "ts-node scripts/create-clob-key.ts",
     "test:custom": "ts-node scripts/test-custom-clob.ts",
@@ -20,6 +29,9 @@
     "sync-inventory": "ts-node scripts/sync-inventory.ts",
     "test-market-maker": "ts-node scripts/test-market-maker.ts",
     "test-websocket": "ts-node scripts/test-websocket.ts",
+    "check-balances": "ts-node scripts/check-balances.ts",
+    "find-proxy": "ts-node scripts/find-proxy.ts",
+    "test-poly-sdk": "ts-node scripts/test-poly-sdk.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
@@ -35,18 +47,22 @@
     "@ethersproject/wallet": "^5.8.0",
     "@polymarket/clob-client": "^4.22.3",
     "@polymarket/order-utils": "^2.1.0",
-    "@polymarket/real-time-data-client": "^1.4.0",
     "axios": "^1.12.2",
     "dotenv": "^17.2.3",
     "ethers": "^6.15.0",
     "pino": "^9.12.0",
-    "ws": "^8.18.3",
-    "zod": "^4.1.11"
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/node": "^24.6.1",
     "@types/ws": "^8.18.1",
+    "c8": "^10.1.3",
+    "depcheck": "^1.4.7",
+    "eslint-plugin-import": "^2.32.0",
+    "knip": "^5.64.3",
+    "madge": "^8.0.0",
     "ts-node": "^10.9.2",
+    "ts-prune": "^0.10.3",
     "typescript": "^5.9.3"
   }
 }

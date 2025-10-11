@@ -2,7 +2,7 @@
 // Exchange (Polygon) - CTFExchange verifyingContract
 export const EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
 export const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // USDC sur Polygon
-export const CHAIN_ID = 137;
+// CHAIN_ID = 137 - REMOVED (unused)
 export const RPC_URL = process.env.RPC_URL || "https://polygon-rpc.com";
 export const POLY_PROXY_ADDRESS = process.env.POLY_PROXY_ADDRESS || "";
 export const WSS_URL = process.env.WSS_URL || "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -34,10 +34,9 @@ export const ALLOWANCE_THRESHOLD_USDC = Number(process.env.ALLOWANCE_THRESHOLD_U
 export const ALLOWANCE_CHECK_COOLDOWN_MS = Number(process.env.ALLOWANCE_CHECK_COOLDOWN_MS) || 30000; // 30 secondes
 
 // Configuration du spread dynamique
-export const SPREAD_MULTIPLIER_LOW = Number(process.env.SPREAD_MULTIPLIER_LOW) || 0.5; // Multiplicateur pour spread serré
-export const SPREAD_MULTIPLIER_HIGH = Number(process.env.SPREAD_MULTIPLIER_HIGH) || 2.0; // Multiplicateur pour spread large
-export const MIN_SPREAD_MULTIPLIER = SPREAD_MULTIPLIER_LOW; // Alias pour compatibilité
-export const MAX_SPREAD_MULTIPLIER = SPREAD_MULTIPLIER_HIGH; // Alias pour compatibilité
+// SPREAD_MULTIPLIER_LOW/HIGH - REMOVED (duplicates, using MIN/MAX instead)
+export const MIN_SPREAD_MULTIPLIER = Number(process.env.SPREAD_MULTIPLIER_LOW) || 0.5; // Multiplicateur pour spread serré
+export const MAX_SPREAD_MULTIPLIER = Number(process.env.SPREAD_MULTIPLIER_HIGH) || 2.0; // Multiplicateur pour spread large
 
 // Configuration de la stratégie de parité
 export const PARITY_THRESHOLD = Number(process.env.PARITY_THRESHOLD) || 0.005; // Écart maximum Yes+No vs 1 pour déclencher l'arbitrage
@@ -61,8 +60,10 @@ export const AUTO_ADJUST_NOTIONAL = process.env.AUTO_ADJUST_NOTIONAL === 'true';
 // Configuration de la réactivité aux mouvements de prix
 // PRICE_CHANGE_THRESHOLD déjà déclaré plus haut
 export const MAX_DISTANCE_FROM_MID = Number(process.env.MAX_DISTANCE_FROM_MID) || 0.05; // 5¢ - distance max du mid-price
-export const MAX_ACTIVE_MARKETS = Number(process.env.MAX_ACTIVE_MARKETS) || 1; // Nombre maximum de marchés actifs (SÉCURITÉ: 1)
+export const MAX_ACTIVE_MARKETS = Number(process.env.MAX_ACTIVE_MARKETS) || 2; // Nombre maximum de marchés actifs (2 pour avoir un fallback)
 export const MIN_VOLUME_USDC = Number(process.env.MIN_VOLUME_USDC) || 5000; // Volume minimum 24h en USDC
+export const MIN_SPREAD_CENTS = Number(process.env.MIN_SPREAD_CENTS) || 0.1; // Spread minimum requis en centimes (0.1¢ = très serré, 0.5¢ = large)
+export const MAX_SPREAD_CENTS = Number(process.env.MAX_SPREAD_CENTS) || 10; // Spread maximum accepté en centimes (10¢ = large mais réaliste)
 
 // Configuration du capital à risque
 export const MAX_NOTIONAL_AT_RISK_USDC = Number(process.env.MAX_NOTIONAL_AT_RISK_USDC) || 15.0; // Capital max exposé

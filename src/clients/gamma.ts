@@ -59,8 +59,19 @@ export async function fetchOpenTradableMarkets(limit=200, offset=0): Promise<Gam
         // Vérifier que c'est un marché actif et non archivé
         if (m.active !== true || m.closed === true || m.archived === true) return false;
         
-        // Vérifier que la date de fin est dans le futur
-        if (m.endDate && new Date(m.endDate) <= new Date()) return false;
+        // Vérifier que le marché accepte les ordres
+        if (m.acceptingOrders === false) return false;
+        
+        // Vérifier que la date de fin est dans le futur (au moins 1 heure)
+        if (m.endDate) {
+          const endDate = new Date(m.endDate);
+          const now = new Date();
+          const oneHourFromNow = new Date(now.getTime() + 60 * 60 * 1000);
+          if (endDate <= oneHourFromNow) {
+            log.debug({ slug: m.slug, endDate: m.endDate }, "Marché exclu : date de fin proche ou passée");
+            return false;
+          }
+        }
         
         // Vérifier que l'orderbook est activé
         if (m.enableOrderBook !== true) return false;

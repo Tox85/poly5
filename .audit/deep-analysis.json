@@ -1,0 +1,382 @@
+[
+  {
+    "file": "src/index.ts",
+    "totalLines": 245,
+    "imports": [
+      "pino",
+      "./config",
+      "./data/discovery",
+      "./data/book",
+      "./marketMaker",
+      "./utils/approve"
+    ],
+    "exports": [
+      "rootLog"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/marketMaker.ts",
+    "totalLines": 1662,
+    "imports": [
+      "./clients/polySDK",
+      "@polymarket/order-utils",
+      "./ws/marketFeed",
+      "./ws/userFeed",
+      "./metrics/pnl",
+      "./index",
+      "./lib/amounts",
+      "./risk/sizing",
+      "./lib/round",
+      "./risk/solvency",
+      "./inventory",
+      "./allowanceManager",
+      "./closeOrders",
+      "ethers"
+    ],
+    "exports": [
+      "MarketMakerConfig",
+      "MarketInfo",
+      "MarketMaker"
+    ],
+    "privateMethods": [
+      "initializeMarketMaking",
+      "startPeriodicTasks",
+      "checkMarketHealth",
+      "handleFill",
+      "tryQuoteOppositeSide",
+      "getNotionalAtRisk",
+      "logCapitalAtRisk",
+      "reconcileOrders",
+      "resyncInventoryFromBlockchain",
+      "startMarketMaking",
+      "handlePriceUpdate",
+      "shouldReplaceOrders",
+      "canReplaceOrders",
+      "getWebSocketPrices",
+      "placeOrders",
+      "checkBuySolvency",
+      "checkSellSolvency",
+      "calculateOrderPrices",
+      "calculateOrderSize",
+      "calculateSellSize",
+      "replaceOrders",
+      "cancelOrders"
+    ],
+    "publicMethods": [],
+    "variables": [],
+    "issues": [
+      "Large file: 1662 lines (consider splitting)",
+      "Many private methods: 22 (review complexity)"
+    ]
+  },
+  {
+    "file": "src/config.ts",
+    "totalLines": 81,
+    "imports": [],
+    "exports": [
+      "EXCHANGE_ADDRESS",
+      "USDC_ADDRESS",
+      "CHAIN_ID",
+      "RPC_URL",
+      "POLY_PROXY_ADDRESS",
+      "WSS_URL",
+      "LOG_LEVEL",
+      "DECIMALS",
+      "PLACE_EVERY_MS",
+      "TARGET_SPREAD_CENTS",
+      "TICK_IMPROVEMENT",
+      "NOTIONAL_PER_ORDER_USDC",
+      "MAX_ACTIVE_ORDERS",
+      "REPLACE_COOLDOWN_MS",
+      "ORDER_TTL_MS",
+      "PRICE_CHANGE_THRESHOLD",
+      "PROXY_ADDRESS",
+      "DRY_RUN",
+      "MAX_INVENTORY",
+      "MIN_INVENTORY_CLEANUP",
+      "ALLOWANCE_THRESHOLD_USDC",
+      "ALLOWANCE_CHECK_COOLDOWN_MS",
+      "SPREAD_MULTIPLIER_LOW",
+      "SPREAD_MULTIPLIER_HIGH",
+      "MIN_SPREAD_MULTIPLIER",
+      "MAX_SPREAD_MULTIPLIER",
+      "PARITY_THRESHOLD",
+      "MIN_SIZE_SHARES",
+      "MIN_NOTIONAL_USDC",
+      "MIN_NOTIONAL_SELL_USDC",
+      "MAX_SELL_PER_ORDER_SHARES",
+      "MAX_INVENTORY_YES",
+      "MAX_INVENTORY_NO",
+      "INVENTORY_PERSISTENCE_FILE",
+      "AUTO_ADJUST_NOTIONAL",
+      "MAX_DISTANCE_FROM_MID",
+      "MAX_ACTIVE_MARKETS",
+      "MIN_VOLUME_USDC",
+      "MIN_SPREAD_CENTS",
+      "MAX_SPREAD_CENTS",
+      "MAX_NOTIONAL_AT_RISK_USDC",
+      "RECONCILE_INTERVAL_MS",
+      "PNL_PERSISTENCE_FILE",
+      "METRICS_LOG_INTERVAL_MS",
+      "WSS_USER_URL",
+      "INVENTORY_SKEW_LAMBDA"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/clients/polySDK.ts",
+    "totalLines": 265,
+    "imports": [
+      "@polymarket/clob-client",
+      "@ethersproject/wallet",
+      "pino"
+    ],
+    "exports": [
+      "PolyClobClient"
+    ],
+    "privateMethods": [
+      "calculatePrice",
+      "calculateSize",
+      "convertSide"
+    ],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/clients/gamma.ts",
+    "totalLines": 123,
+    "imports": [
+      "axios",
+      "pino"
+    ],
+    "exports": [
+      "GammaMarket"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/ws/marketFeed.ts",
+    "totalLines": 252,
+    "imports": [
+      "ws",
+      "../index",
+      "../config"
+    ],
+    "exports": [
+      "MarketFeed"
+    ],
+    "privateMethods": [
+      "connect"
+    ],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/ws/userFeed.ts",
+    "totalLines": 272,
+    "imports": [
+      "ws",
+      "crypto",
+      "../index",
+      "../config"
+    ],
+    "exports": [
+      "FillEvent",
+      "OrderEvent",
+      "UserFeed"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/data/discovery.ts",
+    "totalLines": 78,
+    "imports": [
+      "pino",
+      "../clients/gamma"
+    ],
+    "exports": [],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/data/book.ts",
+    "totalLines": 66,
+    "imports": [
+      "../clients/polySDK",
+      "pino"
+    ],
+    "exports": [
+      "Top"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/risk/solvency.ts",
+    "totalLines": 66,
+    "imports": [
+      "ethers"
+    ],
+    "exports": [
+      "BalanceAllowance",
+      "hasFundsAndAllowance"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/risk/sizing.ts",
+    "totalLines": 178,
+    "imports": [
+      "pino"
+    ],
+    "exports": [
+      "enforceMinSize",
+      "calculateSafeSize",
+      "calculateMaxSafeSize",
+      "calculateMaxSafeSizeWithInventory",
+      "calculateSellSize"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/lib/amounts.ts",
+    "totalLines": 39,
+    "imports": [],
+    "exports": [
+      "Side",
+      "toMicro",
+      "buildAmounts"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/lib/round.ts",
+    "totalLines": 52,
+    "imports": [],
+    "exports": [
+      "roundPrice",
+      "roundSize",
+      "calculateSellSizeShares"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/lib/erc1155.ts",
+    "totalLines": 75,
+    "imports": [
+      "ethers",
+      "pino"
+    ],
+    "exports": [],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/inventory.ts",
+    "totalLines": 343,
+    "imports": [
+      "pino",
+      "ethers",
+      "./config",
+      "fs/promises"
+    ],
+    "exports": [
+      "InventoryManager"
+    ],
+    "privateMethods": [
+      "saveInventory"
+    ],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/allowanceManager.ts",
+    "totalLines": 234,
+    "imports": [
+      "pino",
+      "ethers",
+      "./clients/polySDK",
+      "./config",
+      "./risk/solvency"
+    ],
+    "exports": [
+      "AllowanceManager"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/closeOrders.ts",
+    "totalLines": 170,
+    "imports": [
+      "pino",
+      "./clients/polySDK",
+      "ethers",
+      "./config"
+    ],
+    "exports": [
+      "OrderCloser"
+    ],
+    "privateMethods": [],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  },
+  {
+    "file": "src/metrics/pnl.ts",
+    "totalLines": 260,
+    "imports": [
+      "fs",
+      "../index",
+      "../config"
+    ],
+    "exports": [
+      "Trade",
+      "PnLSummary",
+      "PnLTracker"
+    ],
+    "privateMethods": [
+      "loadFromFile",
+      "saveToFile"
+    ],
+    "publicMethods": [],
+    "variables": [],
+    "issues": []
+  }
+]

@@ -25,7 +25,8 @@ export async function readErc20BalanceAllowance(
   return { balance: BigInt(bal), allowance: BigInt(alw) };
 }
 
-export function hasFundsAndAllowance(
+// Helper function (internal use only)
+function hasFundsAndAllowance(
   required: bigint,     // en micro (1e6)
   ba: BalanceAllowance
 ): boolean {

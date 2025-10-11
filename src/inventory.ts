@@ -1,10 +1,8 @@
 // src/inventory.ts - Gestion de l'inventaire des tokens (shares)
 import pino from "pino";
 import { JsonRpcProvider } from "ethers";
-import { MIN_INVENTORY_CLEANUP } from "./config";
-import { InventoryPersistence } from "./inventoryPersistence";
-import { INVENTORY_PERSISTENCE_FILE, MAX_INVENTORY_YES, MAX_INVENTORY_NO } from "./config";
-import { PersistenceHelper } from "./helpers/persistence";
+import { MIN_INVENTORY_CLEANUP, INVENTORY_PERSISTENCE_FILE, MAX_INVENTORY_YES, MAX_INVENTORY_NO } from "./config";
+import fs from "fs/promises";
 
 const log = pino({ name: "inventory" });
 
@@ -18,8 +16,8 @@ export class InventoryManager {
     this.provider = provider;
     this.maxInventory = maxInventory;
 
-    // Charger l'inventaire depuis le fichier de persistance (synchrone pour le constructeur)
-    this.inventory = InventoryPersistence.loadInventory();
+    // L'inventaire sera chargé via loadFromFile() après l'initialisation
+    this.inventory = new Map();
 
     // NE PAS utiliser syncWithRealPositions() car il contient des valeurs hardcodées
     // La synchronisation réelle sera faite via syncFromOnChainReal() après l'initialisation
@@ -42,16 +40,37 @@ export class InventoryManager {
   /**
    * Sauvegarde l'inventaire dans un fichier spécifique
    */
-  async saveToFile(filePath: string): Promise<void> {
-    await PersistenceHelper.saveInventory(this.inventory, filePath);
-    log.debug({ filePath, count: this.inventory.size }, "📦 Inventory saved to file");
+  async saveToFile(filePath: string = INVENTORY_PERSISTENCE_FILE): Promise<void> {
+    try {
+      const data: Record<string, number> = {};
+      for (const [tokenId, shares] of this.inventory.entries()) {
+        data[tokenId] = shares;
+      }
+      await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
+      log.debug({ filePath, count: this.inventory.size }, "📦 Inventory saved to file");
+    } catch (error) {
+      log.error({ error, filePath }, "Failed to save inventory");
+    }
   }
 
   /**
    * Charge l'inventaire depuis un fichier spécifique
    */
-  async loadFromFile(filePath: string): Promise<Map<string, number>> {
-    return await PersistenceHelper.loadInventory(filePath);
+  async loadFromFile(filePath: string = INVENTORY_PERSISTENCE_FILE): Promise<Map<string, number>> {
+    try {
+      const data = await fs.readFile(filePath, 'utf-8');
+      const parsed = JSON.parse(data) as Record<string, number>;
+      const map = new Map<string, number>();
+      for (const [tokenId, shares] of Object.entries(parsed)) {
+        map.set(tokenId, shares);
+      }
+      this.inventory = map;
+      log.info({ filePath, count: map.size }, "📦 Inventory loaded from file");
+      return map;
+    } catch (error) {
+      log.warn({ error, filePath }, "Could not load inventory file - starting fresh");
+      return new Map();
+    }
   }
 
   /**

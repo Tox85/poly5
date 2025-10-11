@@ -1,12 +1,11 @@
 // src/marketMaker.ts
-import { CustomClobClient } from "./clients/customClob";
+import { PolyClobClient } from "./clients/polySDK";
 import { SignatureType } from "@polymarket/order-utils";
 import { MarketFeed } from "./ws/marketFeed";
 import { UserFeed, FillEvent } from "./ws/userFeed";
 import { PnLTracker } from "./metrics/pnl";
 import { 
-  DECIMALS, 
-  PLACE_EVERY_MS, 
+  // DECIMALS, PLACE_EVERY_MS - REMOVED (unused)
   USDC_ADDRESS, 
   EXCHANGE_ADDRESS, 
   POLY_PROXY_ADDRESS, 
@@ -86,7 +85,7 @@ function buildOrder(
     expiration: "0", // GTC order (Good Till Cancel)
     nonce: "0",      // Nonce par défaut
     feeRateBps: "0",
-    signatureType: SignatureType.POLY_GNOSIS_SAFE, // 2 pour compte Polymarket proxy
+    signatureType: SignatureType.EOA, // 0 = EOA (même avec proxy Polymarket !)
   };
 }
 
@@ -118,7 +117,7 @@ export type MarketInfo = {
 
 export class MarketMaker {
   private config: MarketMakerConfig;
-  private clob: CustomClobClient;
+  private clob: PolyClobClient;
   private feed = new MarketFeed();
   private userFeed!: UserFeed; // Initialisé dans start()
   private pnl = new PnLTracker();
@@ -142,18 +141,19 @@ export class MarketMaker {
   private metricsInterval?: NodeJS.Timeout;
   private reconcileInterval?: NodeJS.Timeout;
   private inventorySyncInterval?: NodeJS.Timeout;
+  private marketHealthCheckInterval?: NodeJS.Timeout;
 
   constructor(config: MarketMakerConfig) {
     this.config = config;
-    // Utiliser notre client personnalisé avec l'authentification L2 corrigée
-    // EOA pour l'auth, proxy pour les fonds
-    this.clob = new CustomClobClient(
+    // Utiliser le SDK officiel Polymarket qui gère correctement les proxies
+    // Le SDK sait comment signer avec l'EOA pour un proxy Polymarket
+    this.clob = new PolyClobClient(
       process.env.PRIVATE_KEY!,
       process.env.CLOB_API_KEY!,
       process.env.CLOB_API_SECRET!,
       process.env.CLOB_PASSPHRASE!,
-      undefined, // baseURL par défaut
-      process.env.POLY_PROXY_ADDRESS // funderAddress = proxy avec les fonds USDC
+      "https://clob.polymarket.com",
+      process.env.POLY_PROXY_ADDRESS // Utiliser le proxy pour les fonds
     );
     
     // Provider pour les vérifications on-chain
@@ -267,7 +267,14 @@ export class MarketMaker {
       }
       
       if (!wsPricesYes || !wsPricesNo) {
-        log.error("❌ Failed to get real prices from both WebSocket AND REST API, aborting");
+        log.error({ 
+          market: this.marketInfo.slug,
+          yesToken: this.marketInfo.yesTokenId.substring(0, 20) + '...',
+          noToken: this.marketInfo.noTokenId.substring(0, 20) + '...'
+        }, "❌ Failed to get real prices from both WebSocket AND REST API - Ce marché est probablement fermé ou inactif");
+        
+        // Arrêter proprement ce market maker
+        await this.stop();
         return;
       }
       
@@ -328,7 +335,7 @@ export class MarketMaker {
   }
 
   /**
-   * Démarrer les tâches périodiques (métriques, réconciliation, resync inventaire)
+   * Démarrer les tâches périodiques (métriques, réconciliation, resync inventaire, health check)
    */
   private startPeriodicTasks() {
     // Logs de métriques toutes les 60s
@@ -347,11 +354,49 @@ export class MarketMaker {
       this.resyncInventoryFromBlockchain();
     }, 120_000); // 2 minutes
     
+    // Vérification de santé du marché toutes les 3 minutes
+    this.marketHealthCheckInterval = setInterval(() => {
+      this.checkMarketHealth();
+    }, 180_000); // 3 minutes
+    
     log.info({ 
       metricsInterval: METRICS_LOG_INTERVAL_MS, 
       reconcileInterval: RECONCILE_INTERVAL_MS,
-      inventorySyncInterval: 120_000
+      inventorySyncInterval: 120_000,
+      marketHealthCheckInterval: 180_000
     }, "⏱️ Periodic tasks started");
+  }
+
+  /**
+   * Vérifie la santé du marché et arrête le trading si le marché devient inactif
+   */
+  private async checkMarketHealth() {
+    if (!this.marketInfo) return;
+    
+    const tokens = [this.marketInfo.yesTokenId, this.marketInfo.noTokenId];
+    let inactiveCount = 0;
+    
+    for (const tokenId of tokens) {
+      const isActive = this.feed.isMarketActive(tokenId, 5 * 60 * 1000); // 5 minutes
+      if (!isActive) {
+        inactiveCount++;
+        log.warn({
+          market: this.marketInfo.slug,
+          tokenId: tokenId.substring(0, 20) + '...',
+          lastUpdate: 'more than 5 minutes ago'
+        }, "⚠️ Token inactif détecté");
+      }
+    }
+    
+    // Si les 2 tokens sont inactifs, arrêter le market making
+    if (inactiveCount === tokens.length) {
+      log.error({
+        market: this.marketInfo.slug,
+        reason: 'Aucune mise à jour de prix depuis plus de 5 minutes'
+      }, "❌ Marché devenu inactif - Arrêt du market making");
+      
+      await this.stop();
+    }
   }
 
   /**
@@ -728,40 +773,48 @@ export class MarketMaker {
   /**
    * Récupère les prix réels depuis le WebSocket (source de vérité)
    * Attend jusqu'à 30 secondes pour obtenir des prix valides
+   * UTILISE LE CACHE pour ne PAS écraser le listener principal
    */
   private async getWebSocketPrices(tokenId: string): Promise<{bestBid: number, bestAsk: number} | null> {
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         log.warn({ tokenId: tokenId.substring(0, 20) + '...' }, "⏰ Timeout waiting for WebSocket prices");
         resolve(null);
-      }, 30000); // 30 secondes max (augmenté pour marchés lents)
+      }, 30000); // 30 secondes max
 
-      // Écouter les mises à jour de prix du WebSocket
-      this.feed.subscribe([tokenId], (id, bestBid, bestAsk) => {
-        // Filtrer les données corrompues
-        const isCorruptedData = (bestBid === 0.001 && bestAsk === 0.999) || 
-                               (bestBid === 0.001 && bestAsk === null) || 
-                               (bestBid === null && bestAsk === 0.999);
+      // Vérifier périodiquement le cache au lieu de subscribe() qui écrase le listener
+      const checkInterval = setInterval(() => {
+        const cached = this.feed.getLastPrices(tokenId);
         
-        if (isCorruptedData) {
-          log.debug({ 
-            tokenId: id.substring(0, 20) + '...',
-            bestBid, 
-            bestAsk 
-          }, "Ignoring corrupted WebSocket data in getWebSocketPrices");
-          return;
-        }
+        if (cached && cached.bestBid !== null && cached.bestAsk !== null) {
+          const { bestBid, bestAsk } = cached;
+          
+          // Filtrer les données corrompues
+          const isCorruptedData = (bestBid === 0.001 && bestAsk === 0.999) || 
+                                 (bestBid === 0.001 && bestAsk === null) || 
+                                 (bestBid === null && bestAsk === 0.999);
+          
+          if (isCorruptedData) {
+            log.debug({ 
+              tokenId: tokenId.substring(0, 20) + '...',
+              bestBid, 
+              bestAsk 
+            }, "Ignoring corrupted cached prices");
+            return;
+          }
 
-        if (bestBid !== null && bestAsk !== null && bestBid > 0 && bestAsk < 1 && bestBid < bestAsk) {
-          clearTimeout(timeout);
-          log.info({
-            tokenId: id.substring(0, 20) + '...',
-            bestBid: bestBid.toFixed(4),
-            bestAsk: bestAsk.toFixed(4)
-          }, "✅ Real WebSocket prices obtained");
-          resolve({ bestBid, bestAsk });
+          if (bestBid > 0 && bestAsk < 1 && bestBid < bestAsk) {
+            clearTimeout(timeout);
+            clearInterval(checkInterval);
+            log.info({
+              tokenId: tokenId.substring(0, 20) + '...',
+              bestBid: bestBid.toFixed(4),
+              bestAsk: bestAsk.toFixed(4)
+            }, "✅ Real WebSocket prices obtained from cache");
+            resolve({ bestBid, bestAsk });
+          }
         }
-      });
+      }, 500); // Vérifier toutes les 500ms
     });
   }
 
@@ -834,11 +887,30 @@ export class MarketMaker {
       const canBuy = buySize !== null && buySolvent && (currentInventory + (buySize || 0)) <= maxInventory;
       const canSell = sellSize !== null && sellSolvent && currentInventory >= (sellSize || 0);
 
-      // PRIORISER LA VENTE QUAND ON A DE L'INVENTAIRE (logique de cycle)
-      // Si on a de l'inventaire, on vend d'abord pour libérer du capital
+      // LOGIQUE DE MARKET MAKING : Placer BUY et SELL simultanément
+      // Un market maker doit TOUJOURS offrir des deux côtés du marché
       const hasInventory = currentInventory > 0;
-      const shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false) && !hasInventory;
+      
+      // CORRECTION : Placer des ordres BUY même avec inventaire (pour capturer le spread)
+      const shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false);
       const shouldPlaceSell = canSell && (parityBias !== 'BUY') && (options?.placeSell !== false);
+      
+      // DEBUG : Vérifier chaque condition individuellement
+      log.debug({
+        tokenId: tokenId.substring(0, 20) + '...',
+        tokenSide,
+        canBuy,
+        parityBiasNotSELL: parityBias !== 'SELL',
+        optionsPlaceBuyNotFalse: options?.placeBuy !== false,
+        shouldPlaceBuy,
+        canSell,
+        parityBiasNotBUY: parityBias !== 'BUY',
+        optionsPlaceSellNotFalse: options?.placeSell !== false,
+        shouldPlaceSell
+      }, "🔍 DEBUG: Order placement conditions breakdown");
+      
+      // Si on a de l'inventaire, on peut toujours vendre (logique conservée)
+      // Mais on peut aussi acheter pour faire du market making complet
       
       log.info({
         tokenId: tokenId.substring(0, 20) + '...',
@@ -847,6 +919,9 @@ export class MarketMaker {
         currentInventory: currentInventory.toFixed(2),
         shouldPlaceBuy,
         shouldPlaceSell,
+        parityBias: parityBias || 'undefined',
+        canBuy,
+        canSell,
         reason: hasInventory ? 'Priority to SELL (has inventory)' : 'Normal BUY/SELL logic'
       }, "🎯 Order placement decision");
 
@@ -1479,6 +1554,9 @@ export class MarketMaker {
     }
     if (this.inventorySyncInterval) {
       clearInterval(this.inventorySyncInterval);
+    }
+    if (this.marketHealthCheckInterval) {
+      clearInterval(this.marketHealthCheckInterval);
     }
     
     // Annuler tous les ordres actifs

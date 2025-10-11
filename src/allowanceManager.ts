@@ -1,14 +1,14 @@
 // src/allowanceManager.ts - Gestion automatique des allowances USDC
 import pino from "pino";
 import { JsonRpcProvider } from "ethers";
-import { CustomClobClient } from "./clients/customClob";
+import { PolyClobClient } from "./clients/polySDK";
 import { USDC_ADDRESS, POLY_PROXY_ADDRESS, EXCHANGE_ADDRESS, ALLOWANCE_CHECK_COOLDOWN_MS } from "./config";
 import { readErc20BalanceAllowance } from "./risk/solvency";
 
 const log = pino({ name: "allowanceManager" });
 
 export class AllowanceManager {
-  private clob: CustomClobClient;
+  private clob: PolyClobClient;
   private provider: JsonRpcProvider;
   private allowanceThresholdUsdc: number;
   private lastAllowanceCheckTime: number = 0;
@@ -17,7 +17,7 @@ export class AllowanceManager {
   private isUpdating: boolean = false;
 
   constructor(
-    clob: CustomClobClient,
+    clob: PolyClobClient,
     provider: JsonRpcProvider,
     allowanceThresholdUsdc: number = 100
   ) {

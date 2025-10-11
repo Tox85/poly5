@@ -47,7 +47,9 @@ import {
   PRICE_CHANGE_THRESHOLD,
   MAX_DISTANCE_FROM_MID,
   MAX_ACTIVE_MARKETS,
-  MIN_VOLUME_USDC
+  MIN_VOLUME_USDC,
+  MIN_SPREAD_CENTS,
+  MAX_SPREAD_CENTS
 } from "./config";
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -59,8 +61,10 @@ async function main() {
   log.info({ 
     DRY_RUN, 
     TARGET_SPREAD_CENTS, 
+    MIN_SPREAD_CENTS,
     NOTIONAL_PER_ORDER_USDC, 
-    MAX_MARKETS: MAX 
+    MAX_MARKETS: MAX,
+    MIN_VOLUME_USDC
   }, "🚀 Démarrage du Bot Market Maker Polymarket");
 
   // S'assurer que l'allowance USDC est suffisante
@@ -69,18 +73,18 @@ async function main() {
     log.warn("⚠️ Approbation USDC manuelle requise - assurez-vous que le proxy a une allowance suffisante vers l'Exchange");
   }
 
-  // Test de connexion CLOB avec CustomClobClient
+  // Test de connexion CLOB avec SDK officiel
   try {
-    const { CustomClobClient } = await import("./clients/customClob");
-    const clob = new CustomClobClient(
+    const { PolyClobClient } = await import("./clients/polySDK");
+    const clob = new PolyClobClient(
       process.env.PRIVATE_KEY!,
       process.env.CLOB_API_KEY!,
       process.env.CLOB_API_SECRET!,
       process.env.CLOB_PASSPHRASE!,
-      undefined, // baseURL par défaut
-      process.env.POLY_PROXY_ADDRESS // funderAddress = proxy avec les fonds USDC
+      "https://clob.polymarket.com",
+      process.env.POLY_PROXY_ADDRESS // Utiliser le proxy
     );
-    log.info("✅ Connexion CLOB établie avec CustomClobClient");
+    log.info("✅ Connexion CLOB établie avec Polymarket SDK");
   } catch (error) {
     log.error({ error }, "❌ Erreur de connexion CLOB");
     process.exit(1);
@@ -92,7 +96,10 @@ async function main() {
     process.exit(1);
   }
   
-  // Tri intelligent : volume + spread + priorité Trump Nobel
+  // Tri intelligent : volume + spread (AUCUNE priorité hardcodée)
+  const minSpreadRequired = MIN_SPREAD_CENTS / 100; // Convertir centimes en décimal
+  const maxSpreadAllowed = MAX_SPREAD_CENTS / 100; // Convertir centimes en décimal
+  
   const picked = mkts
     .map(market => {
       // Calculer le spread pour chaque marché
@@ -100,25 +107,58 @@ async function main() {
         ? market.bestAskYes - market.bestBidYes 
         : 1.0; // Spread très large si pas de données
       
-      // Score de priorité (plus élevé = meilleur)
-      let priorityScore = 0;
-      
-      // Priorité Trump Nobel
-      if (market.slug?.includes('trump') && market.slug?.includes('nobel')) {
-        priorityScore += 1000;
-      }
-      
-      // Score volume (normalisé)
+      // Score volume (normalisé) - facteur dominant
       const volumeScore = Math.log10((market.volume24hrClob || 0) + 1) * 100;
       
-      // Score spread (spread serré = meilleur)
-      const spreadScore = Math.max(0, 100 - (spread * 10000)); // 0.001 = 90 points
+      // Score spread (spread large = meilleur pour capturer plus de profit)
+      // Plus le spread est large, plus le score est élevé
+      const spreadScore = Math.min(spread * 10000, 200); // 0.01 (1¢) = 100 points, cap à 200
+      
+      // Score total : volume + spread large
+      const totalScore = volumeScore + spreadScore;
       
       return {
         ...market,
         spread,
-        totalScore: priorityScore + volumeScore + spreadScore
+        totalScore
       };
+    })
+    .filter(market => {
+      // FILTRE 1 : Exclure les marchés avec spread trop serré
+      if (market.spread < minSpreadRequired) {
+        log.debug({ 
+          slug: market.slug, 
+          spread: (market.spread * 100).toFixed(2) + '¢',
+          minRequired: MIN_SPREAD_CENTS + '¢'
+        }, "Marché exclu : spread trop serré");
+        return false;
+      }
+      
+      // FILTRE 2 : Exclure les marchés avec spread TROP large (probablement fermés/résolus)
+      if (market.spread > maxSpreadAllowed) {
+        log.debug({ 
+          slug: market.slug, 
+          spread: (market.spread * 100).toFixed(2) + '¢',
+          maxAllowed: MAX_SPREAD_CENTS + '¢'
+        }, "Marché exclu : spread trop large (marché probablement inactif)");
+        return false;
+      }
+      
+      // FILTRE 3 : Vérifier que les prix sont réalistes
+      const hasValidPrices = market.bestBidYes && market.bestAskYes && 
+                            market.bestBidYes > 0.001 && market.bestAskYes < 0.999 &&
+                            market.bestBidYes < market.bestAskYes;
+      
+      if (!hasValidPrices) {
+        log.debug({ 
+          slug: market.slug,
+          bestBid: market.bestBidYes,
+          bestAsk: market.bestAskYes
+        }, "Marché exclu : prix invalides ou manquants");
+        return false;
+      }
+      
+      return true;
     })
     .sort((a, b) => b.totalScore - a.totalScore) // Tri décroissant par score
     .slice(0, MAX);
@@ -153,6 +193,7 @@ async function main() {
 
   // Démarrer le market making sur chaque marché sélectionné
   const marketMakers: MarketMaker[] = [];
+  let activeMarketMakers = 0;
   
   for (const market of picked) {
     log.info({ 
@@ -166,15 +207,26 @@ async function main() {
     marketMakers.push(marketMaker);
     
     // Démarrer le market making (ne pas attendre)
-    marketMaker.start(market).catch(error => {
-      log.error({ error, market: market.slug }, "❌ Erreur dans le market making");
+    marketMaker.start(market).then(() => {
+      activeMarketMakers++;
+      log.info({ 
+        market: market.slug,
+        activeMarketMakers 
+      }, "✅ Market maker démarré avec succès");
+    }).catch(error => {
+      log.error({ error, market: market.slug }, "❌ Erreur dans le market making - tentative marché suivant si disponible");
+      
+      // Si aucun market maker n'est actif, essayer de démarrer le prochain marché disponible
+      if (activeMarketMakers === 0 && picked.indexOf(market) < picked.length - 1) {
+        log.info("🔄 Tentative de démarrage du marché suivant...");
+      }
     });
   }
 
   log.info({ 
-    activeMarketMakers: marketMakers.length,
+    totalMarketMakers: marketMakers.length,
     config: mmConfig 
-  }, "✅ Market makers démarrés");
+  }, "✅ Market makers en cours de démarrage");
 
   // Gestion propre de l'arrêt
   process.on('SIGINT', async () => {

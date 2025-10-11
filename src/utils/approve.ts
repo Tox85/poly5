@@ -1,5 +1,5 @@
 // src/utils/approve.ts - Utilitaire d'approbation USDC pour le proxy
-import { CustomClobClient } from "../clients/customClob";
+import { PolyClobClient } from "../clients/polySDK";
 import { JsonRpcProvider } from "ethers";
 import { USDC_ADDRESS, RPC_URL, POLY_PROXY_ADDRESS, EXCHANGE_ADDRESS } from "../config";
 import { readErc20BalanceAllowance } from "../risk/solvency";
@@ -14,12 +14,12 @@ export async function ensureUsdcAllowance(
 ) {
   const provider = new JsonRpcProvider(RPC_URL);
   
-  const clob = new CustomClobClient(
+  const clob = new PolyClobClient(
     privateKey,
     apiKey,
     apiSecret,
     passphrase,
-    undefined,
+    "https://clob.polymarket.com",
     POLY_PROXY_ADDRESS
   );
 

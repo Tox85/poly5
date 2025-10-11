@@ -75,45 +75,9 @@ export function calculateMaxSafeSize(
   return calculateSafeSize(maxNotionalUsdc, price, minSize, 1.0);
 }
 
-/**
- * Calcule la taille maximale en tenant compte de l'inventaire actuel
- * @param maxNotionalUsdc - Notional maximum en USDC
- * @param price - Prix par share
- * @param currentInventory - Inventaire actuel
- * @param maxInventory - Inventaire maximum autorisé
- * @param minSize - Taille minimum en shares
- * @returns Taille maximale sécurisée ou null
- */
-export function calculateMaxSafeSizeWithInventory(
-  maxNotionalUsdc: number,
-  price: number,
-  currentInventory: number,
-  maxInventory: number,
-  minSize: number = 5
-): number | null {
-  // Calculer la taille maximale basée sur le notional
-  const maxSizeByNotional = calculateMaxSafeSize(maxNotionalUsdc, price, minSize);
-  if (!maxSizeByNotional) return null;
-
-  // Calculer la taille maximale basée sur l'inventaire
-  const maxSizeByInventory = maxInventory - currentInventory;
-  
-  // Retourner la plus petite des deux
-  const finalSize = Math.min(maxSizeByNotional, maxSizeByInventory);
-  
-  if (finalSize < minSize) {
-    log.debug({ 
-      maxSizeByNotional, 
-      maxSizeByInventory, 
-      currentInventory, 
-      maxInventory, 
-      minSize 
-    }, "Taille limitée par inventaire");
-    return null;
-  }
-
-  return finalSize;
-}
+// UNUSED: calculateMaxSafeSizeWithInventory - REMOVED (2025-10-11)
+// Reason: Never called externally, logic handled in MarketMaker.calculateOrderSize()
+// Preserved in .graveyard if needed in future
 
 /**
  * Calcule une taille sécurisée pour les ordres SELL avec notional minimum

@@ -1,0 +1,7 @@
+[
+  "src/clients/customClob.ts",
+  "src/clients/signer.ts",
+  "src/helpers/persistence.ts",
+  "src/inventoryPersistence.ts",
+  "src/utils/logLimiter.ts"
+]

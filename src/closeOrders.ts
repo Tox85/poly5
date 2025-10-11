@@ -1,16 +1,16 @@
 // src/closeOrders.ts - Script pour fermer les ordres ouverts
 import pino from "pino";
-import { CustomClobClient } from "./clients/customClob";
+import { PolyClobClient } from "./clients/polySDK";
 import { JsonRpcProvider } from "ethers";
 import { RPC_URL, POLY_PROXY_ADDRESS } from "./config";
 
 const log = pino({ name: "close-orders" });
 
 export class OrderCloser {
-  private clob: CustomClobClient;
+  private clob: PolyClobClient;
   private provider: JsonRpcProvider;
 
-  constructor(clob: CustomClobClient, inventoryManager: any, provider?: JsonRpcProvider) {
+  constructor(clob: PolyClobClient, inventoryManager: any, provider?: JsonRpcProvider) {
     this.clob = clob;
     this.provider = provider || new JsonRpcProvider(RPC_URL);
     log.info("🗑️ OrderCloser initialized");

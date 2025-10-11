@@ -1,5 +1,5 @@
 // src/data/book.ts
-import { CustomClobClient } from "../clients/customClob";
+import { PolyClobClient } from "../clients/polySDK";
 import pino from "pino";
 
 const log = pino({ name: "book" });
@@ -7,15 +7,15 @@ const log = pino({ name: "book" });
 export type Top = { bestBid:number|null; bestAsk:number|null; tickSize:number|null; negRisk:boolean|null };
 
 export async function snapshotTop(tokenId: string): Promise<Top> {
-  const clob = new CustomClobClient(
+  const clob = new PolyClobClient(
     process.env.PRIVATE_KEY!,
     process.env.CLOB_API_KEY!,
     process.env.CLOB_API_SECRET!,
     process.env.CLOB_PASSPHRASE!,
-    undefined, // baseURL par défaut
-    process.env.POLY_PROXY_ADDRESS // funderAddress = proxy avec les fonds USDC
+    "https://clob.polymarket.com",
+    process.env.POLY_PROXY_ADDRESS
   );
-  const book = await clob.getOrderBook(tokenId); // REST /book
+  const book = await clob.getOrderBook(tokenId);
   
   // Ne pas forcer des valeurs par défaut - utiliser ce que le serveur fournit
   const bestBid = book?.bids?.length ? Number(book.bids[0].price) : null;
@@ -32,7 +32,7 @@ export async function snapshotTop(tokenId: string): Promise<Top> {
  * Récupère le prix de la dernière transaction RÉELLE pour un token donné.
  * Utilisé pour détecter des mouvements rapides du marché.
  * @param tokenId ID du token ERC-1155
- * @param clob Instance du CustomClobClient
+ * @param clob Instance du PolyClobClient
  * @returns Prix de la dernière transaction réelle ou null si aucune donnée
  */
 export async function fetchLastTradePrice(tokenId: string, clob: any): Promise<number | null> {

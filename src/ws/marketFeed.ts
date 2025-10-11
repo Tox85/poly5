@@ -16,19 +16,42 @@ export class MarketFeed {
   private lastPrices = new Map<string, {bestBid: number|null, bestAsk: number|null}>();
   // Anti-spam pour les logs de prix
   private lastPriceLogs = new Map<string, {bid: number|null, ask: number|null}>();
+  // Timestamp de la dernière mise à jour par token (pour détecter les marchés inactifs)
+  private lastPriceUpdateTime = new Map<string, number>();
   private currentTokenIds: string[] = [];
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
   private isConnecting = false;
 
   subscribe(tokenIds: string[], onUpdate: (tokenId:string, bb:number|null, ba:number|null)=>void) {
-    tokenIds.forEach(t => this.listeners.set(t, (bb,ba)=>onUpdate(t,bb,ba)));
+    // Ne PAS écraser les listeners existants, juste ajouter/mettre à jour
+    tokenIds.forEach(t => {
+      const existing = this.listeners.get(t);
+      if (!existing) {
+        this.listeners.set(t, (bb,ba)=>onUpdate(t,bb,ba));
+        log.debug({ tokenId: t.substring(0, 20) + '...' }, "Listener added");
+      } else {
+        log.debug({ tokenId: t.substring(0, 20) + '...' }, "Listener already exists, keeping it");
+      }
+    });
     this.currentTokenIds = tokenIds;
     this.connect(tokenIds);
   }
   
   getLastPrices(tokenId: string): { bestBid: number|null, bestAsk: number|null } | null {
     return this.lastPrices.get(tokenId) || null;
+  }
+
+  /**
+   * Vérifie si un token a reçu une mise à jour récente (dans les 5 minutes)
+   * Retourne false si le marché semble inactif
+   */
+  isMarketActive(tokenId: string, maxAgeMs: number = 5 * 60 * 1000): boolean {
+    const lastUpdate = this.lastPriceUpdateTime.get(tokenId);
+    if (!lastUpdate) return false;
+    
+    const age = Date.now() - lastUpdate;
+    return age < maxAgeMs;
   }
 
   private connect(tokenIds: string[]) {
@@ -100,6 +123,9 @@ export class MarketFeed {
               // Mettre à jour le cache (source de vérité)
               this.lastPrices.set(pc.asset_id, { bestBid: bb, bestAsk: ba });
               
+              // Mettre à jour le timestamp de dernière activité
+              this.lastPriceUpdateTime.set(pc.asset_id, Date.now());
+              
               // Notifier les listeners
               this.listeners.get(pc.asset_id)?.(bb,ba);
               
@@ -138,6 +164,9 @@ export class MarketFeed {
                 bestBid: bb, 
                 bestAsk: ba 
               });
+              
+              // Mettre à jour le timestamp de dernière activité
+              this.lastPriceUpdateTime.set(asset, Date.now());
               
               this.listeners.get(asset)?.(bb, ba);
               log.info({ asset_id: asset, best_bid: bb, best_ask: ba, source: "book+validated" }, "book snapshot");
