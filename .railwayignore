@@ -1,0 +1,11 @@
+node_modules
+.env
+.env.local
+*.log
+.git
+README.md
+.audit
+tools
+scripts
+*.txt
+*.md

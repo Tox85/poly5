@@ -4,7 +4,6 @@
   "description": "Bot de Market Making pour Polymarket",
   "main": "src/index.ts",
   "scripts": {
-    "preinstall": "npm cache clean --force || true",
     "start": "npm run build && node dist/index.js",
     "build": "tsc",
     "dev": "ts-node --watch src/index.ts",
