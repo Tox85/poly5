@@ -22,8 +22,8 @@ RUN npm run build
 # Clean up dev dependencies après le build
 RUN npm prune --production
 
-# Expose port
-EXPOSE 3000
+# Expose port (Railway will set PORT env var)
+EXPOSE $PORT
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \

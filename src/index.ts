@@ -1,11 +1,30 @@
 // Point d'entrée principal - PolymMM-GuardedSpread
 import "dotenv/config";
+import { createServer } from "http";
 import { DRY_RUN } from "./config";
 import { PolyClobClient } from "./clients/polySDK";
 import { MarketMaker } from "./core/MarketMaker";
 import { rootLog } from "./logger";
 
 const log = rootLog.child({ name: "main" });
+
+// ============================================================
+// SERVEUR HTTP POUR HEALTH CHECK RAILWAY
+// ============================================================
+const PORT = process.env.PORT || 3000;
+const server = createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ 
+      status: "healthy", 
+      timestamp: new Date().toISOString(),
+      service: "polymm-guarded-spread"
+    }));
+  } else {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
+  }
+});
 
 // ============================================================
 // VALIDATION DES VARIABLES D'ENVIRONNEMENT
@@ -65,6 +84,11 @@ async function main() {
   );
   log.info("✅ CLOB client initialized");
 
+  // Démarrer le serveur HTTP pour Railway health check
+  server.listen(PORT, () => {
+    log.info(`🌐 HTTP server listening on port ${PORT} for health checks`);
+  });
+
   // Créer et démarrer le Market Maker
   const marketMaker = new MarketMaker(clob);
   await marketMaker.start();
@@ -73,6 +97,9 @@ async function main() {
   const shutdown = async () => {
     log.info("🛑 Shutdown signal received, stopping bot...");
     await marketMaker.stop();
+    server.close(() => {
+      log.info("👋 HTTP server closed");
+    });
     log.info("👋 Bot stopped gracefully");
     process.exit(0);
   };
