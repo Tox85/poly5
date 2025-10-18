@@ -112,7 +112,7 @@ export class UserFeed {
         type: "user",
         markets: [], // tous mes évènements utilisateur
         auth: { 
-          apikey: this.apiKey, 
+          apiKey: this.apiKey, 
           secret: this.apiSecret, 
           passphrase: this.passphrase 
         }

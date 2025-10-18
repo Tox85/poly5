@@ -18,6 +18,20 @@ export function roundTo(x: number, decimals: number): number {
 }
 
 /**
+ * Quantisation contrôlée par le tick actuel
+ */
+export function quantize(price: number, size: number, tick: number, minSize: number) {
+  const dec = (x: number) => Math.max(0, (tick.toString().split('.')[1] || '').length);
+  const priceDecimals = dec(tick);
+  const qPrice = Math.round(price / tick) * tick;
+  const qPriceFixed = +qPrice.toFixed(priceDecimals);
+  const qSize = Math.max(size, minSize);
+  // taille arrondie à 2 décimales par défaut (cf. clients officiels) :
+  const qSizeFixed = +qSize.toFixed(2);
+  return { price: qPriceFixed, size: qSizeFixed };
+}
+
+/**
  * Règle Polymarket (implicite dans les erreurs serveur) :
  * - shares -> 2 décimales
  * - notional USDC -> 5 décimales

@@ -1,7 +1,7 @@
 // Order Manager - Gestion des ordres (un seul actif par marché, side-lock, replace logic)
 import pino from "pino";
 import { PolyClobClient } from "../clients/polySDK";
-import { buildAmounts } from "../lib/amounts";
+import { buildAmounts, quantize } from "../lib/amounts";
 import { SignatureType } from "@polymarket/order-utils";
 import {
   ORDER_TTL_MS,
@@ -70,13 +70,28 @@ export class OrderManager {
   }
 
   /**
+   * Calcule le prix optimal pour passer devant la file
+   */
+  stepAheadPrice(side: Side, bestBid: number, bestAsk: number, tick: number): number {
+    if (side === "BUY") {
+      // BUY: améliorer d'1 tick au-dessus du best bid, sans croiser le ask
+      return Math.min(bestAsk - tick, bestBid + tick);
+    } else {
+      // SELL: améliorer d'1 tick en-dessous du best ask, sans croiser le bid
+      return Math.max(bestBid + tick, bestAsk - tick);
+    }
+  }
+
+  /**
    * Place un ordre BUY au best bid
    */
   async placeBuy(
     tokenId: string,
     bestBid: number,
     bestAsk: number,
-    size: number
+    size: number,
+    tick: number = DEFAULT_TICK_SIZE,
+    minSize: number = 1.0
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
       // Vérifier qu'il n'y a pas déjà un ordre actif
@@ -90,8 +105,35 @@ export class OrderManager {
         return { success: false, error: "order_already_active" };
       }
 
-      // Prix = best bid (join the market)
-      const price = bestBid;
+      // Quantiser prix et taille selon le tick et minSize
+      const { price: qPrice, size: qSize } = quantize(bestBid, size, tick, minSize);
+      
+      // Vérifier que le prix quantifié est valide
+      if (qPrice >= bestAsk) {
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          originalPrice: bestBid.toFixed(4),
+          quantizedPrice: qPrice.toFixed(4),
+          bestAsk: bestAsk.toFixed(4),
+          tick: tick.toFixed(4)
+        }, "⚠️ Would cross after quantization");
+        return { success: false, error: "would_cross_after_quantization" };
+      }
+
+      // Vérifier que la taille respecte le minSize
+      if (qSize < minSize) {
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          originalSize: size,
+          quantizedSize: qSize,
+          minSize,
+          tick: tick.toFixed(4)
+        }, "⚠️ Size below minimum after quantization");
+        return { success: false, error: "size_below_minimum" };
+      }
+
+      const price = qPrice;
+      const finalSize = qSize;
 
       // Post-only check: s'assurer qu'on ne croise pas
       if (price >= bestAsk) {
@@ -106,7 +148,7 @@ export class OrderManager {
       // Construire l'ordre
       const maker = this.clob.getMakerAddress();
       const signer = this.clob.getAddress();
-      const orderData = buildOrder("BUY", tokenId, price, size, maker, signer);
+      const orderData = buildOrder("BUY", tokenId, price, finalSize, maker, signer);
 
       const order = {
         deferExec: false,
@@ -119,11 +161,13 @@ export class OrderManager {
         tokenId: tokenId.substring(0, 20) + '...',
         side: "BUY",
         price: price.toFixed(4),
-        size,
-        notional: (price * size).toFixed(2),
+        size: finalSize,
+        notional: (price * finalSize).toFixed(2),
         bestBid: bestBid.toFixed(4),
-        bestAsk: bestAsk.toFixed(4)
-      }, "📤 Placing BUY order");
+        bestAsk: bestAsk.toFixed(4),
+        tick: tick.toFixed(4),
+        minSize
+      }, "📤 Placing BUY order (quantized)");
 
       if (DRY_RUN) {
         log.info("🔵 DRY RUN: BUY order NOT placed");
@@ -141,7 +185,7 @@ export class OrderManager {
           tokenId,
           side: "BUY",
           price,
-          size,
+          size: finalSize,
           placedAt: Date.now(),
           lastBestBid: bestBid,
           lastBestAsk: bestAsk
@@ -179,7 +223,9 @@ export class OrderManager {
     tokenId: string,
     bestBid: number,
     bestAsk: number,
-    size: number
+    size: number,
+    tick: number = DEFAULT_TICK_SIZE,
+    minSize: number = 1.0
   ): Promise<{ success: boolean; orderId?: string; error?: string }> {
     try {
       // Vérifier qu'il n'y a pas déjà un ordre actif
@@ -193,8 +239,35 @@ export class OrderManager {
         return { success: false, error: "order_already_active" };
       }
 
-      // Prix = best ask (join the market)
-      const price = bestAsk;
+      // Quantiser prix et taille selon le tick et minSize
+      const { price: qPrice, size: qSize } = quantize(bestAsk, size, tick, minSize);
+      
+      // Vérifier que le prix quantifié est valide
+      if (qPrice <= bestBid) {
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          originalPrice: bestAsk.toFixed(4),
+          quantizedPrice: qPrice.toFixed(4),
+          bestBid: bestBid.toFixed(4),
+          tick: tick.toFixed(4)
+        }, "⚠️ Would cross after quantization");
+        return { success: false, error: "would_cross_after_quantization" };
+      }
+
+      // Vérifier que la taille respecte le minSize
+      if (qSize < minSize) {
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          originalSize: size,
+          quantizedSize: qSize,
+          minSize,
+          tick: tick.toFixed(4)
+        }, "⚠️ Size below minimum after quantization");
+        return { success: false, error: "size_below_minimum" };
+      }
+
+      const price = qPrice;
+      const finalSize = qSize;
 
       // Post-only check: s'assurer qu'on ne croise pas
       if (price <= bestBid) {
@@ -209,7 +282,7 @@ export class OrderManager {
       // Construire l'ordre
       const maker = this.clob.getMakerAddress();
       const signer = this.clob.getAddress();
-      const orderData = buildOrder("SELL", tokenId, price, size, maker, signer);
+      const orderData = buildOrder("SELL", tokenId, price, finalSize, maker, signer);
 
       const order = {
         deferExec: false,
@@ -222,11 +295,13 @@ export class OrderManager {
         tokenId: tokenId.substring(0, 20) + '...',
         side: "SELL",
         price: price.toFixed(4),
-        size,
-        notional: (price * size).toFixed(2),
+        size: finalSize,
+        notional: (price * finalSize).toFixed(2),
         bestBid: bestBid.toFixed(4),
-        bestAsk: bestAsk.toFixed(4)
-      }, "📤 Placing SELL order");
+        bestAsk: bestAsk.toFixed(4),
+        tick: tick.toFixed(4),
+        minSize
+      }, "📤 Placing SELL order (quantized)");
 
       if (DRY_RUN) {
         log.info("🔵 DRY RUN: SELL order NOT placed");
@@ -244,7 +319,7 @@ export class OrderManager {
           tokenId,
           side: "SELL",
           price,
-          size,
+          size: finalSize,
           placedAt: Date.now(),
           lastBestBid: bestBid,
           lastBestAsk: bestAsk
@@ -289,15 +364,19 @@ export class OrderManager {
       return { success: false };
     }
 
+    // Récupérer le tick dynamique (utiliser DEFAULT_TICK_SIZE en fallback)
+    const tick = DEFAULT_TICK_SIZE; // TODO: récupérer depuis marketFeed
+    
     // Vérifier si le prix a changé suffisamment (REPLACE_PRICE_TICKS)
     const priceDiff = Math.abs(newBestBid - existing.price);
-    if (priceDiff < REPLACE_PRICE_TICKS * DEFAULT_TICK_SIZE) {
+    if (priceDiff < REPLACE_PRICE_TICKS * tick) {
       log.debug({
         tokenId: tokenId.substring(0, 20) + '...',
         oldPrice: existing.price.toFixed(4),
         newPrice: newBestBid.toFixed(4),
         diff: priceDiff.toFixed(4),
-        threshold: (REPLACE_PRICE_TICKS * DEFAULT_TICK_SIZE).toFixed(4)
+        threshold: (REPLACE_PRICE_TICKS * tick).toFixed(4),
+        tick: tick.toFixed(4)
       }, "Price change too small for replace");
       return { success: false };
     }
@@ -311,7 +390,7 @@ export class OrderManager {
 
     // Cancel puis place
     await this.cancelOrder(tokenId);
-    return await this.placeBuy(tokenId, newBestBid, newBestAsk, existing.size);
+    return await this.placeBuy(tokenId, newBestBid, newBestAsk, existing.size, tick, 1.0);
   }
 
   /**
@@ -328,15 +407,19 @@ export class OrderManager {
       return { success: false };
     }
 
+    // Récupérer le tick dynamique (utiliser DEFAULT_TICK_SIZE en fallback)
+    const tick = DEFAULT_TICK_SIZE; // TODO: récupérer depuis marketFeed
+    
     // Vérifier si le prix a changé suffisamment
     const priceDiff = Math.abs(newBestAsk - existing.price);
-    if (priceDiff < REPLACE_PRICE_TICKS * DEFAULT_TICK_SIZE) {
+    if (priceDiff < REPLACE_PRICE_TICKS * tick) {
       log.debug({
         tokenId: tokenId.substring(0, 20) + '...',
         oldPrice: existing.price.toFixed(4),
         newPrice: newBestAsk.toFixed(4),
         diff: priceDiff.toFixed(4),
-        threshold: (REPLACE_PRICE_TICKS * DEFAULT_TICK_SIZE).toFixed(4)
+        threshold: (REPLACE_PRICE_TICKS * tick).toFixed(4),
+        tick: tick.toFixed(4)
       }, "Price change too small for replace");
       return { success: false };
     }
@@ -350,7 +433,7 @@ export class OrderManager {
 
     // Cancel puis place
     await this.cancelOrder(tokenId);
-    return await this.placeSell(tokenId, newBestBid, newBestAsk, existing.size);
+    return await this.placeSell(tokenId, newBestBid, newBestAsk, existing.size, tick, 1.0);
   }
 
   /**
@@ -416,13 +499,15 @@ export class OrderManager {
     }
 
     // Prix changé significativement
+    const tick = DEFAULT_TICK_SIZE; // TODO: récupérer depuis marketFeed
     const priceDiff = Math.abs(currentBestBid - order.price);
-    if (priceDiff >= REPLACE_PRICE_TICKS * DEFAULT_TICK_SIZE) {
+    if (priceDiff >= REPLACE_PRICE_TICKS * tick) {
       log.debug({
         tokenId: tokenId.substring(0, 20) + '...',
         oldPrice: order.price.toFixed(4),
         newPrice: currentBestBid.toFixed(4),
-        diff: priceDiff.toFixed(4)
+        diff: priceDiff.toFixed(4),
+        tick: tick.toFixed(4)
       }, "💹 BUY price changed significantly");
       return true;
     }
@@ -450,13 +535,15 @@ export class OrderManager {
     }
 
     // Prix changé significativement
+    const tick = DEFAULT_TICK_SIZE; // TODO: récupérer depuis marketFeed
     const priceDiff = Math.abs(currentBestAsk - order.price);
-    if (priceDiff >= REPLACE_PRICE_TICKS * DEFAULT_TICK_SIZE) {
+    if (priceDiff >= REPLACE_PRICE_TICKS * tick) {
       log.debug({
         tokenId: tokenId.substring(0, 20) + '...',
         oldPrice: order.price.toFixed(4),
         newPrice: currentBestAsk.toFixed(4),
-        diff: priceDiff.toFixed(4)
+        diff: priceDiff.toFixed(4),
+        tick: tick.toFixed(4)
       }, "💹 SELL price changed significantly");
       return true;
     }

@@ -20,6 +20,10 @@ export class MarketFeed {
   private lastPriceUpdateTime = new Map<string, number>();
   // Cache des tick_size par token (dynamique)
   private tickSizes = new Map<string, number>();
+  // Cache des min_order_size par token
+  private minOrderSizes = new Map<string, number>();
+  // Dirty flags par token pour déclencher les décisions
+  private dirtyFlags = new Map<string, boolean>();
   private currentTokenIds: string[] = [];
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
@@ -61,9 +65,9 @@ export class MarketFeed {
 
   private flushSubscription() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    // CORRECTIF: Utiliser "MARKET" en majuscules comme dans la version fonctionnelle
-    this.ws.send(JSON.stringify({ type: "MARKET", assets_ids: Array.from(this.subscribed) }));
-    log.info({ count: this.subscribed.size }, "📡 Subscription envoyée (MARKET)");
+    // CORRECTIF: Utiliser sortie "market" en minuscules comme requis par la doc Polymarket
+    this.ws.send(JSON.stringify({ type: "market", assets_ids: Array.from(this.subscribed) }));
+    log.info({ count: this.subscribed.size }, "📡 Subscription envoyée (market)");
   }
 
   // Parsing post-migration (schema 2025-09-15)
@@ -80,6 +84,7 @@ export class MarketFeed {
         if (bb !== null && ba !== null && bb < ba && bb > 0 && ba <= 1) {
           this.lastPrices.set(asset, { bestBid: bb, bestAsk: ba });
           this.lastPriceUpdateTime.set(asset, Date.now());
+          this.dirtyFlags.set(asset, true); // Marquer comme dirty pour déclencher les décisions
           this.listeners.get(asset)?.(bb, ba);
           log.debug({ 
             asset: asset.substring(0, 20) + '...', 
@@ -120,6 +125,7 @@ export class MarketFeed {
           // Valeurs valides : mettre à jour
           this.lastPrices.set(pc.asset_id, { bestBid: bid, bestAsk: ask });
           this.lastPriceUpdateTime.set(pc.asset_id, Date.now());
+          this.dirtyFlags.set(pc.asset_id, true); // Marquer comme dirty pour déclencher les décisions
           this.listeners.get(pc.asset_id)?.(bid, ask);
           log.debug({ 
             asset: pc.asset_id.substring(0, 20) + '...', 
@@ -135,6 +141,7 @@ export class MarketFeed {
         const newTickSize = Number(msg.new_tick_size);
         if (newTickSize > 0 && newTickSize <= 1) {
           this.tickSizes.set(msg.asset_id, newTickSize);
+          this.dirtyFlags.set(msg.asset_id, true); // Marquer comme dirty pour déclencher les décisions
           log.info({ 
             asset: msg.asset_id.substring(0, 20) + '...', 
             newTickSize 
@@ -181,6 +188,45 @@ export class MarketFeed {
     if (tickSize > 0 && tickSize <= 1) {
       this.tickSizes.set(tokenId, tickSize);
     }
+  }
+
+  /**
+   * Récupère le min_order_size pour un token donné
+   */
+  getMinOrderSize(tokenId: string): number | null {
+    return this.minOrderSizes.get(tokenId) || null;
+  }
+
+  /**
+   * Définit le min_order_size pour un token (depuis /book)
+   */
+  setMinOrderSize(tokenId: string, minOrderSize: number): void {
+    if (minOrderSize > 0) {
+      this.minOrderSizes.set(tokenId, minOrderSize);
+    }
+  }
+
+  /**
+   * Vérifie si un token a des mises à jour en attente (dirty flag)
+   */
+  isDirty(tokenId: string): boolean {
+    return this.dirtyFlags.get(tokenId) || false;
+  }
+
+  /**
+   * Marque un token comme clean (après traitement)
+   */
+  markClean(tokenId: string): void {
+    this.dirtyFlags.set(tokenId, false);
+  }
+
+  /**
+   * Récupère tous les tokens dirty
+   */
+  getDirtyTokens(): string[] {
+    return Array.from(this.dirtyFlags.entries())
+      .filter(([_, dirty]) => dirty)
+      .map(([tokenId, _]) => tokenId);
   }
 
   /**
