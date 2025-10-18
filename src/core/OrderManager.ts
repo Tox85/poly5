@@ -105,35 +105,12 @@ export class OrderManager {
         return { success: false, error: "order_already_active" };
       }
 
-      // Quantiser prix et taille selon le tick et minSize
-      const { price: qPrice, size: qSize } = quantize(bestBid, size, tick, minSize);
+      // Prix = best bid (join the market) - PAS de quantisation pour éviter de croiser
+      const price = bestBid;
       
-      // Vérifier que le prix quantifié est valide
-      if (qPrice >= bestAsk) {
-        log.warn({
-          tokenId: tokenId.substring(0, 20) + '...',
-          originalPrice: bestBid.toFixed(4),
-          quantizedPrice: qPrice.toFixed(4),
-          bestAsk: bestAsk.toFixed(4),
-          tick: tick.toFixed(4)
-        }, "⚠️ Would cross after quantization");
-        return { success: false, error: "would_cross_after_quantization" };
-      }
-
-      // Vérifier que la taille respecte le minSize
-      if (qSize < minSize) {
-        log.warn({
-          tokenId: tokenId.substring(0, 20) + '...',
-          originalSize: size,
-          quantizedSize: qSize,
-          minSize,
-          tick: tick.toFixed(4)
-        }, "⚠️ Size below minimum after quantization");
-        return { success: false, error: "size_below_minimum" };
-      }
-
-      const price = qPrice;
-      const finalSize = qSize;
+      // Quantiser uniquement la taille
+      const finalSize = Math.max(size, minSize);
+      const finalSizeRounded = +finalSize.toFixed(2);
 
       // Post-only check: s'assurer qu'on ne croise pas
       if (price >= bestAsk) {
@@ -148,7 +125,7 @@ export class OrderManager {
       // Construire l'ordre
       const maker = this.clob.getMakerAddress();
       const signer = this.clob.getAddress();
-      const orderData = buildOrder("BUY", tokenId, price, finalSize, maker, signer);
+      const orderData = buildOrder("BUY", tokenId, price, finalSizeRounded, maker, signer);
 
       const order = {
         deferExec: false,
@@ -161,13 +138,11 @@ export class OrderManager {
         tokenId: tokenId.substring(0, 20) + '...',
         side: "BUY",
         price: price.toFixed(4),
-        size: finalSize,
-        notional: (price * finalSize).toFixed(2),
+        size: finalSizeRounded,
+        notional: (price * finalSizeRounded).toFixed(2),
         bestBid: bestBid.toFixed(4),
-        bestAsk: bestAsk.toFixed(4),
-        tick: tick.toFixed(4),
-        minSize
-      }, "📤 Placing BUY order (quantized)");
+        bestAsk: bestAsk.toFixed(4)
+      }, "📤 Placing BUY order");
 
       if (DRY_RUN) {
         log.info("🔵 DRY RUN: BUY order NOT placed");
@@ -185,7 +160,7 @@ export class OrderManager {
           tokenId,
           side: "BUY",
           price,
-          size: finalSize,
+          size: finalSizeRounded,
           placedAt: Date.now(),
           lastBestBid: bestBid,
           lastBestAsk: bestAsk
@@ -239,35 +214,12 @@ export class OrderManager {
         return { success: false, error: "order_already_active" };
       }
 
-      // Quantiser prix et taille selon le tick et minSize
-      const { price: qPrice, size: qSize } = quantize(bestAsk, size, tick, minSize);
+      // Prix = best ask (join the market) - PAS de quantisation pour éviter de croiser
+      const price = bestAsk;
       
-      // Vérifier que le prix quantifié est valide
-      if (qPrice <= bestBid) {
-        log.warn({
-          tokenId: tokenId.substring(0, 20) + '...',
-          originalPrice: bestAsk.toFixed(4),
-          quantizedPrice: qPrice.toFixed(4),
-          bestBid: bestBid.toFixed(4),
-          tick: tick.toFixed(4)
-        }, "⚠️ Would cross after quantization");
-        return { success: false, error: "would_cross_after_quantization" };
-      }
-
-      // Vérifier que la taille respecte le minSize
-      if (qSize < minSize) {
-        log.warn({
-          tokenId: tokenId.substring(0, 20) + '...',
-          originalSize: size,
-          quantizedSize: qSize,
-          minSize,
-          tick: tick.toFixed(4)
-        }, "⚠️ Size below minimum after quantization");
-        return { success: false, error: "size_below_minimum" };
-      }
-
-      const price = qPrice;
-      const finalSize = qSize;
+      // Quantiser uniquement la taille
+      const finalSize = Math.max(size, minSize);
+      const finalSizeRounded = +finalSize.toFixed(2);
 
       // Post-only check: s'assurer qu'on ne croise pas
       if (price <= bestBid) {
@@ -282,7 +234,7 @@ export class OrderManager {
       // Construire l'ordre
       const maker = this.clob.getMakerAddress();
       const signer = this.clob.getAddress();
-      const orderData = buildOrder("SELL", tokenId, price, finalSize, maker, signer);
+      const orderData = buildOrder("SELL", tokenId, price, finalSizeRounded, maker, signer);
 
       const order = {
         deferExec: false,
@@ -295,13 +247,11 @@ export class OrderManager {
         tokenId: tokenId.substring(0, 20) + '...',
         side: "SELL",
         price: price.toFixed(4),
-        size: finalSize,
-        notional: (price * finalSize).toFixed(2),
+        size: finalSizeRounded,
+        notional: (price * finalSizeRounded).toFixed(2),
         bestBid: bestBid.toFixed(4),
-        bestAsk: bestAsk.toFixed(4),
-        tick: tick.toFixed(4),
-        minSize
-      }, "📤 Placing SELL order (quantized)");
+        bestAsk: bestAsk.toFixed(4)
+      }, "📤 Placing SELL order");
 
       if (DRY_RUN) {
         log.info("🔵 DRY RUN: SELL order NOT placed");
@@ -319,7 +269,7 @@ export class OrderManager {
           tokenId,
           side: "SELL",
           price,
-          size: finalSize,
+          size: finalSizeRounded,
           placedAt: Date.now(),
           lastBestBid: bestBid,
           lastBestAsk: bestAsk
