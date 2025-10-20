@@ -78,3 +78,8 @@ export const WSS_USER_URL = process.env.WSS_USER_URL || "wss://ws-subscriptions-
 
 // Configuration du skew d'inventaire
 export const INVENTORY_SKEW_LAMBDA = Number(process.env.INVENTORY_SKEW_LAMBDA) || 0.002; // 0.2% par 100 shares
+
+// Configuration de la rotation des marchés et filtrage temporel
+export const MIN_HOURS_TO_CLOSE = Number(process.env.MIN_HOURS_TO_CLOSE) || 48; // Filtre sélection (≥ 48h avant fermeture)
+export const MARKET_ROTATION_INTERVAL_MS = Number(process.env.MARKET_ROTATION_INTERVAL_MS) || 600_000; // 10 min - intervalle de rotation
+export const MARKET_EXIT_HYSTERESIS_MS = Number(process.env.MARKET_EXIT_HYSTERESIS_MS) || 900_000; // 15 min tampon avant fermeture

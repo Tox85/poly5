@@ -30,7 +30,8 @@ import {
   PROXY_ADDRESS,
   NOTIONAL_PER_ORDER_USDC,
   MAX_SELL_PER_ORDER_SHARES,
-  MIN_NOTIONAL_SELL_USDC
+  MIN_NOTIONAL_SELL_USDC,
+  MARKET_EXIT_HYSTERESIS_MS
 } from "./config";
 import { rootLog } from "./index";
 import { buildAmounts } from "./lib/amounts";
@@ -117,6 +118,8 @@ export type MarketInfo = {
   yesTokenId: string;
   noTokenId: string;
   volume24hrClob?: number | null;
+  endDate?: string | null;        // NEW
+  hoursToClose?: number | null;   // NEW (snapshot au start)
 };
 
 export class MarketMaker {
@@ -146,6 +149,9 @@ export class MarketMaker {
   private reconcileInterval?: NodeJS.Timeout;
   private inventorySyncInterval?: NodeJS.Timeout;
   private marketHealthCheckInterval?: NodeJS.Timeout;
+  
+  // Flag d'état pour la rotation
+  public stopped = false;
 
   constructor(config: MarketMakerConfig) {
     this.config = config;
@@ -174,6 +180,7 @@ export class MarketMaker {
   }
 
   async start(market: MarketInfo) {
+    this.stopped = false;
     this.marketInfo = market;
     log.info({ market: market.slug }, "🚀 Starting market making");
 
@@ -511,6 +518,21 @@ export class MarketMaker {
       }, "❌ Marché devenu inactif - Arrêt du market making");
       
       await this.stop();
+      return;
+    }
+    
+    // Vérification de proximité de fermeture
+    if (this.marketInfo?.endDate) {
+      const msToClose = new Date(this.marketInfo.endDate).getTime() - Date.now();
+      if (msToClose <= MARKET_EXIT_HYSTERESIS_MS) {
+        log.warn({ 
+          market: this.marketInfo.slug, 
+          msToClose: Math.round(msToClose / 1000 / 60), // en minutes
+          hoursToClose: (msToClose / 3_600_000).toFixed(1)
+        }, "⏳ Near close - stopping this market maker");
+        await this.stop();
+        return;
+      }
     }
   }
 
@@ -1190,7 +1212,7 @@ export class MarketMaker {
       
       // CORRECTION : Placer des ordres BUY même avec inventaire (pour capturer le spread)
       const shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false);
-      const shouldPlaceSell = canSell && (parityBias !== 'BUY') && (options?.placeSell !== false);
+      let shouldPlaceSell = canSell && (parityBias !== 'BUY') && (options?.placeSell !== false);
       
       // DEBUG : Vérifier chaque condition individuellement
       log.debug({
@@ -1263,6 +1285,7 @@ export class MarketMaker {
             tokenSide,
             side: "BUY",
             price: bidPrice.toFixed(4),
+            priceRoundedToTick: (Math.round(bidPrice / 0.001) * 0.001).toFixed(4),
             size: buySize,
             notional: (bidPrice * (buySize || 0)).toFixed(5),
             makerAmount: buyAmounts.makerAmount.toString(),
@@ -1342,15 +1365,16 @@ export class MarketMaker {
           );
           
           if (!isApproved) {
-            log.warn({
+            log.error({
               slug: this.marketInfo.slug,
               tokenId: tokenId.substring(0, 20) + '...',
               tokenSide
-            }, "⚠️ ERC-1155 not approved for Exchange. Please approve manually on Polymarket or via setApprovalForAll()");
-            // On continue quand même car l'approbation peut être faite manuellement
+            }, "❌ ERC-1155 not approved for Exchange. Blocking SELL placement.");
+            shouldPlaceSell = false; // force skip SELL
           }
           
-          const maker = this.clob.getMakerAddress();
+          if (shouldPlaceSell) {
+            const maker = this.clob.getMakerAddress();
           const signer = this.clob.getAddress();
           const sellAmounts = buildAmounts("SELL", askPrice, sellSize!);
           const sellOrderData = buildOrder("SELL", tokenId, askPrice, sellSize!, maker, signer);
@@ -1370,6 +1394,7 @@ export class MarketMaker {
             tokenSide,
             side: "SELL",
             price: askPrice.toFixed(4),
+            priceRoundedToTick: (Math.round(askPrice / 0.001) * 0.001).toFixed(4),
             size: sellSize,
             notional: (askPrice * (sellSize || 0)).toFixed(5),
             makerAmount: sellAmounts.makerAmount.toString(),
@@ -1407,6 +1432,7 @@ export class MarketMaker {
               notional: (askPrice * sellSize!).toFixed(2),
               timestamp: new Date().toISOString()
             }, "✅ SELL order POSTED (inventory will update on fill)");
+          }
           }
         } catch (error) {
           log.error({ error, tokenId: tokenId.substring(0, 20) + '...', tokenSide, side: "SELL" }, "❌ Error placing SELL order");
@@ -1955,6 +1981,9 @@ export class MarketMaker {
     // Log final des métriques
     log.info("📊 Final PnL summary:");
     this.pnl.logMetrics();
+    
+    // Marquer comme arrêté pour la rotation
+    this.stopped = true;
   }
 
   /**
@@ -2036,5 +2065,12 @@ export class MarketMaker {
    */
   getAllowanceStatus(): any {
     return this.allowanceManager.getSummary();
+  }
+
+  /**
+   * Vérifie si le market maker est arrêté
+   */
+  isStopped(): boolean { 
+    return this.stopped; 
   }
 }

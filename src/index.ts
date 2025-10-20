@@ -52,7 +52,10 @@ import {
   MAX_ACTIVE_MARKETS,
   MIN_VOLUME_USDC,
   MIN_SPREAD_CENTS,
-  MAX_SPREAD_CENTS
+  MAX_SPREAD_CENTS,
+  MIN_HOURS_TO_CLOSE,
+  MARKET_ROTATION_INTERVAL_MS,
+  MARKET_EXIT_HYSTERESIS_MS
 } from "./config";
 
 const log = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -105,11 +108,20 @@ async function main() {
     process.exit(1);
   }
   
+  // FILTRE TEMPOREL : Exclure les marchés trop proches de la fermeture
+  const withTime = mkts.filter(m => (m.hoursToClose ?? 1e9) >= MIN_HOURS_TO_CLOSE);
+  
+  log.info({ 
+    total: mkts.length, 
+    afterTimeFilter: withTime.length,
+    minHoursToClose: MIN_HOURS_TO_CLOSE
+  }, "📅 Marchés après filtrage temporel");
+  
   // Tri intelligent : volume + spread (AUCUNE priorité hardcodée)
   const minSpreadRequired = MIN_SPREAD_CENTS / 100; // Convertir centimes en décimal
   const maxSpreadAllowed = MAX_SPREAD_CENTS / 100; // Convertir centimes en décimal
   
-  const picked = mkts
+  const candidates = withTime
     .map(market => {
       // Calculer le spread pour chaque marché
       const spread = market.bestAskYes && market.bestBidYes 
@@ -171,13 +183,16 @@ async function main() {
     })
     .sort((a, b) => b.totalScore - a.totalScore) // Tri décroissant par score
     .slice(0, MAX);
+  
+  const picked = candidates;
   log.info({ 
     selected: picked.length,
     markets: picked.map(m => ({ 
       slug: m.slug, 
       volume: m.volume24hrClob,
       spread: m.spread?.toFixed(4),
-      score: m.totalScore?.toFixed(1)
+      score: m.totalScore?.toFixed(1),
+      hoursToClose: m.hoursToClose?.toFixed(1)
     }))
   }, "📊 Marchés sélectionnés pour le market making");
 
@@ -202,6 +217,7 @@ async function main() {
 
   // Démarrer le market making sur chaque marché sélectionné
   const marketMakers: MarketMaker[] = [];
+  let running: { mm: MarketMaker; slug: string }[] = [];
   let activeMarketMakers = 0;
   
   for (const market of picked) {
@@ -218,6 +234,7 @@ async function main() {
     // Démarrer le market making (ne pas attendre)
     marketMaker.start(market).then(() => {
       activeMarketMakers++;
+      running.push({ mm: marketMaker, slug: market.slug });
       log.info({ 
         market: market.slug,
         activeMarketMakers 
@@ -236,6 +253,60 @@ async function main() {
     totalMarketMakers: marketMakers.length,
     config: mmConfig 
   }, "✅ Market makers en cours de démarrage");
+
+  // Système de rotation douce des marchés
+  setInterval(async () => {
+    try {
+      // 1) Re-scan des marchés
+      const fresh = await discoverLiveClobMarkets(200, MIN_VOLUME_USDC);
+      const freshWithTime = fresh.filter(m => (m.hoursToClose ?? 1e9) >= MIN_HOURS_TO_CLOSE);
+
+      // 2) Slugs en cours
+      const active = running.filter(r => !r.mm.isStopped());
+      const activeSlugs = new Set(active.map(r => r.slug));
+
+      // 3) Candidats non utilisés
+      const minSpread = MIN_SPREAD_CENTS / 100;
+      const maxSpread = MAX_SPREAD_CENTS / 100;
+      const pool = freshWithTime
+        .map(m => {
+          const spread = (m.bestAskYes && m.bestBidYes) ? (m.bestAskYes - m.bestBidYes) : 1.0;
+          const volumeScore = Math.log10((m.volume24hrClob ?? 0) + 1) * 100;
+          const spreadScore = Math.min(spread * 10_000, 200);
+          return { m, spread, score: volumeScore + spreadScore };
+        })
+        .filter(x => x.spread >= minSpread && x.spread <= maxSpread)
+        .sort((a,b) => b.score - a.score)
+        .map(x => x.m)
+        .filter(m => !activeSlugs.has(m.slug));
+
+      // 4) Si on a de la place, on démarre de nouveaux marchés
+      const capacity = MAX_ACTIVE_MARKETS - active.length;
+      for (const mkt of pool.slice(0, Math.max(0, capacity))) {
+        const mm = new MarketMaker(mmConfig);
+        mm.start(mkt).catch(err => log.error({ err, slug: mkt.slug }, "Rotation start failed"));
+        running.push({ mm, slug: mkt.slug });
+        log.info({ slug: mkt.slug }, "🔁 Rotation: started new market");
+      }
+
+      // 5) Nettoyage de la liste (retire les stoppés)
+      running = running.filter(r => !r.mm.isStopped());
+      
+      log.debug({ 
+        active: active.length, 
+        capacity: MAX_ACTIVE_MARKETS,
+        pool: pool.length,
+        started: Math.max(0, capacity)
+      }, "🔄 Rotation cycle completed");
+    } catch (e) {
+      log.error({ e }, "Rotation loop error");
+    }
+  }, MARKET_ROTATION_INTERVAL_MS);
+
+  log.info({ 
+    rotationInterval: MARKET_ROTATION_INTERVAL_MS / 1000 / 60, // en minutes
+    maxActiveMarkets: MAX_ACTIVE_MARKETS
+  }, "🔄 Système de rotation activé");
 
   // Gestion propre de l'arrêt (SIGINT = Ctrl+C local)
   process.on('SIGINT', async () => {

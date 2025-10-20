@@ -16,6 +16,8 @@ type Picked = {
   bestBidNo?: number|null;
   bestAskNo?: number|null;
   volume24hrClob?: number|null;
+  endDate?: string | null;
+  hoursToClose?: number | null;
 };
 
 export async function discoverLiveClobMarkets(max=50, minVol=0): Promise<Picked[]> {
@@ -52,6 +54,10 @@ export async function discoverLiveClobMarkets(max=50, minVol=0): Promise<Picked[
     const yesTokenId = tokenIds[0]; // Premier token = Yes
     const noTokenId = tokenIds[1];  // Deuxième token = No
     
+    // Calculer les heures avant fermeture
+    const end = gm.endDate ? new Date(gm.endDate) : null;
+    const hoursToClose = end ? Math.max(0, (end.getTime() - Date.now()) / 3_600_000) : null;
+    
     out.push({
       conditionId: gm.conditionId || gm.id,
       slug: gm.slug || gm.id,
@@ -59,7 +65,9 @@ export async function discoverLiveClobMarkets(max=50, minVol=0): Promise<Picked[
       noTokenId: noTokenId,
       bestBidYes: gm.bestBid ?? null,
       bestAskYes: gm.bestAsk ?? null,
-      volume24hrClob: gm.volume24hrClob ?? null
+      volume24hrClob: gm.volume24hrClob ?? null,
+      endDate: gm.endDate ?? null,
+      hoursToClose: hoursToClose
     });
     
     log.info({ 
@@ -68,6 +76,7 @@ export async function discoverLiveClobMarkets(max=50, minVol=0): Promise<Picked[
       volume: gm.volume24hrClob,
       bestBid: gm.bestBid,
       bestAsk: gm.bestAsk,
+      hoursToClose: hoursToClose?.toFixed(1),
       yesToken: yesTokenId.substring(0, 20) + '...',
       noToken: noTokenId.substring(0, 20) + '...'
     }, "Marché ajouté");
