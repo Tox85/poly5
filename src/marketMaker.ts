@@ -31,7 +31,9 @@ import {
   NOTIONAL_PER_ORDER_USDC,
   MAX_SELL_PER_ORDER_SHARES,
   MIN_NOTIONAL_SELL_USDC,
-  MARKET_EXIT_HYSTERESIS_MS
+  MARKET_EXIT_HYSTERESIS_MS,
+  MAX_ACTIVE_ORDERS_PER_SIDE,
+  REPLACE_COOLDOWN_MS
 } from "./config";
 import { rootLog } from "./index";
 import { buildAmounts } from "./lib/amounts";
@@ -78,8 +80,10 @@ function buildOrder(
   const uniqueSalt = Date.now() * 1000 + Math.floor(Math.random() * 1000);
 
   // IDEMPOTENCE : Générer un clientOrderId unique pour éviter les doublons
-  // Format: side-tokenId(court)-price-timestamp
-  const clientOrderId = `${side}-${tokenId.substring(0, 10)}-${price.toFixed(4)}-${Date.now()}`;
+  // Format: side-tokenId(court)-price-timestamp-random
+  // ✅ FIX: Ajout d'un random pour éviter les collisions sur placements simultanés
+  const random = Math.random().toString(36).substring(2, 8); // 6 caractères aléatoires
+  const clientOrderId = `${side}-${tokenId.substring(0, 10)}-${price.toFixed(4)}-${Date.now()}-${random}`;
 
   return {
     // champs du PostOrder → cf. docs "Place Single Order"
@@ -146,10 +150,14 @@ export class MarketMaker {
     askClientOrderId?: string; // NOUVEAU : Pour idempotence
   }>();
   private placedClientOrderIds = new Set<string>(); // NOUVEAU : Tracking des IDs déjà utilisés
+  private liveClientOrderIds = new Set<string>(); // NOUVEAU : Tracking des ordres LIVE via UserFeed
   private lastReplaceTime = 0;
+  private lastReplaceTimeBySide = new Map<string, {bid: number, ask: number}>(); // NOUVEAU : Cooldown par side
   private marketInfo: MarketInfo | null = null;
   private lastPlaceTime = 0; // Anti-spam pour les logs
   private provider: JsonRpcProvider;
+  // ✅ FIX #4: Cache des derniers prix traités pour éviter le spam
+  private lastProcessedPrices = new Map<string, {bestBid: number, bestAsk: number}>();
   private inventory: InventoryManager;
   private allowanceManager: AllowanceManager;
   private orderCloser: OrderCloser;
@@ -157,6 +165,8 @@ export class MarketMaker {
   private reconcileInterval?: NodeJS.Timeout;
   private inventorySyncInterval?: NodeJS.Timeout;
   private marketHealthCheckInterval?: NodeJS.Timeout;
+  private cleanupInterval?: NodeJS.Timeout; // ✅ FIX #7: Interval pour cleanup clientOrderIds
+  private apiOrdersZeroRechecks = new Map<string, number>(); // NOUVEAU : Compteur de rechecks pour API=0
   
   // Flag d'état pour la rotation
   public stopped = false;
@@ -197,7 +207,8 @@ export class MarketMaker {
       process.env.CLOB_API_KEY!,
       process.env.CLOB_API_SECRET!,
       process.env.CLOB_PASSPHRASE!,
-      this.clob.getAddress() // Signing key = EOA
+      this.clob.getAddress(), // Signing key = EOA
+      this.clob // ✅ FIX #9: Passer le client CLOB pour le mini-resync
     );
     
     // Connecter au WebSocket utilisateur
@@ -489,12 +500,44 @@ export class MarketMaker {
       this.checkMarketHealth();
     }, 180_000); // 3 minutes
     
+    // ✅ FIX #7: Nettoyage périodique des clientOrderIds (éviter fuite mémoire)
+    this.cleanupInterval = setInterval(() => {
+      this.cleanupClientOrderIds();
+    }, 300_000); // 5 minutes
+    
     log.info({ 
       metricsInterval: METRICS_LOG_INTERVAL_MS, 
       reconcileInterval: RECONCILE_INTERVAL_MS,
       inventorySyncInterval: 120_000,
-      marketHealthCheckInterval: 180_000
+      marketHealthCheckInterval: 180_000,
+      cleanupInterval: 300_000
     }, "⏱️ Periodic tasks started");
+  }
+  
+  /**
+   * ✅ FIX #2: Nettoie les anciens clientOrderIds basé sur les événements UserFeed
+   * Ne plus se baser sur activeOrders pour éviter la perte d'idempotence
+   */
+  private cleanupClientOrderIds() {
+    const beforeSize = this.placedClientOrderIds.size;
+    
+    // NOUVEAU : Nettoyer seulement les IDs qui sont dans liveClientOrderIds
+    // (alimenté par les événements UserFeed: CANCELLED/MATCHED)
+    this.placedClientOrderIds = new Set([...this.placedClientOrderIds].filter(id => 
+      !this.liveClientOrderIds.has(id)
+    ));
+    
+    const afterSize = this.placedClientOrderIds.size;
+    const cleaned = beforeSize - afterSize;
+    
+    if (cleaned > 0) {
+      log.info({
+        beforeSize,
+        afterSize,
+        cleaned,
+        liveIds: this.liveClientOrderIds.size
+      }, "🧹 Cleaned up old clientOrderIds based on UserFeed events");
+    }
   }
 
   /**
@@ -554,24 +597,50 @@ export class MarketMaker {
     const size = parseFloat(fill.size);
     const fee = parseFloat(fill.fee || "0");
     
+    // ✅ FIX #6: Logging enrichi pour debug des fills
+    const tokenSide = tokenId === this.marketInfo?.yesTokenId ? 'YES' : 
+                     tokenId === this.marketInfo?.noTokenId ? 'NO' : 'UNKNOWN';
+    
     // Mettre à jour l'inventaire RÉEL
     if (fill.side === "BUY") {
+      const oldInventory = this.inventory.getInventory(tokenId);
       this.inventory.addBuy(tokenId, size);
+      const newInventory = this.inventory.getInventory(tokenId);
+      
       log.info({
+        event: "fill_buy",
+        slug: this.marketInfo?.slug,
         tokenId: tokenId.substring(0, 20) + '...',
+        tokenSide,
         side: "BUY",
+        orderId: fill.orderId.substring(0, 16) + '...',
         price: price.toFixed(4),
         size: size.toFixed(2),
-        newInventory: this.inventory.getInventory(tokenId).toFixed(2)
+        fee: fee.toFixed(4),
+        oldInventory: oldInventory.toFixed(2),
+        newInventory: newInventory.toFixed(2),
+        delta: size.toFixed(2),
+        timestamp: new Date(fill.timestamp).toISOString()
       }, "📦 Inventory updated (BUY fill)");
     } else {
+      const oldInventory = this.inventory.getInventory(tokenId);
       this.inventory.addSell(tokenId, size);
+      const newInventory = this.inventory.getInventory(tokenId);
+      
       log.info({
+        event: "fill_sell",
+        slug: this.marketInfo?.slug,
         tokenId: tokenId.substring(0, 20) + '...',
+        tokenSide,
         side: "SELL",
+        orderId: fill.orderId.substring(0, 16) + '...',
         price: price.toFixed(4),
         size: size.toFixed(2),
-        newInventory: this.inventory.getInventory(tokenId).toFixed(2)
+        fee: fee.toFixed(4),
+        oldInventory: oldInventory.toFixed(2),
+        newInventory: newInventory.toFixed(2),
+        delta: (-size).toFixed(2),
+        timestamp: new Date(fill.timestamp).toISOString()
       }, "📦 Inventory updated (SELL fill)");
     }
     
@@ -593,18 +662,43 @@ export class MarketMaker {
     // Forcer refresh de l'allowance USDC (le solde a changé)
     this.allowanceManager.forceUsdcCheck();
     
+    // ✅ FIX #2: Marquer l'ordre comme MATCHED dans liveClientOrderIds
+    this.liveClientOrderIds.add(fill.orderId);
+    
     // HEDGE AUTOMATIQUE : Placer un ordre inverse pour neutraliser l'exposition
-    this.placeHedgeOrder(tokenId, fill.side, price, size);
+    this.placeHedgeOrder(tokenId, fill.side, price, size, fill.orderId);
     
     // RÉACTIVITÉ POST-FILL : Tenter la jambe opposée (désactivé car remplacé par hedge)
     // this.tryQuoteOppositeSide(tokenId, fill.side);
+  }
+
+  /**
+   * NOUVEAU : Handler pour les événements d'ordre (LIVE, CANCELLED, MATCHED)
+   * Alimente liveClientOrderIds pour l'idempotence
+   */
+  private handleOrderEvent(orderId: string, status: 'LIVE' | 'CANCELLED' | 'MATCHED') {
+    if (status === 'LIVE') {
+      // Ordre confirmé comme actif
+      this.liveClientOrderIds.add(orderId);
+      log.debug({
+        orderId: orderId.substring(0, 16) + '...',
+        status
+      }, "📋 Order marked as LIVE");
+    } else if (status === 'CANCELLED' || status === 'MATCHED') {
+      // Ordre terminé, peut être nettoyé
+      this.liveClientOrderIds.add(orderId);
+      log.debug({
+        orderId: orderId.substring(0, 16) + '...',
+        status
+      }, "📋 Order marked as terminated");
+    }
   }
   
   /**
    * Place automatiquement un ordre inverse après un fill pour neutraliser l'exposition
    * HEDGE: Si on a acheté (BUY fill), on place un SELL. Si on a vendu (SELL fill), on place un BUY.
    */
-  private async placeHedgeOrder(tokenId: string, filledSide: "BUY" | "SELL", filledPrice: number, filledSize: number): Promise<void> {
+  private async placeHedgeOrder(tokenId: string, filledSide: "BUY" | "SELL", filledPrice: number, filledSize: number, fillOrderId: string): Promise<void> {
     if (!this.marketInfo || this.config.dryRun) return;
     
     try {
@@ -667,15 +761,27 @@ export class MarketMaker {
       // Construire et placer l'ordre de hedge
       const maker = this.clob.getMakerAddress();
       const signer = this.clob.getAddress();
-      const hedgeOrderData = buildOrder(hedgeSide, tokenId, hedgePrice, filledSize, maker, signer);
+      
+      // ✅ FIX #7: Générer un clientOrderId déterministe pour le hedge
+      // Basé sur l'ordre parent et la taille cumulative pour éviter les doublons
+      const cumulativeFilledSizeRounded = Math.round(filledSize * 100) / 100; // Arrondir à 2 décimales
+      const deterministicClientOrderId = `${fillOrderId}-${hedgeSide}-${cumulativeFilledSizeRounded}`;
+      
+      // Créer l'ordre avec le clientOrderId déterministe
+      const hedgeOrderData = {
+        ...buildOrder(hedgeSide, tokenId, hedgePrice, filledSize, maker, signer),
+        clientOrderId: deterministicClientOrderId
+      };
       
       // Vérifier l'idempotence
       if (this.placedClientOrderIds.has(hedgeOrderData.clientOrderId)) {
         log.warn({
           clientOrderId: hedgeOrderData.clientOrderId,
           tokenId: tokenId.substring(0, 20) + '...',
-          side: hedgeSide
-        }, "⚠️ Duplicate hedge clientOrderId - skipping");
+          hedgeSide,
+          filledSize: cumulativeFilledSizeRounded
+        }, "⚠️ Duplicate hedge clientOrderId - skipping hedge");
+        // ✅ FIX: Return OK ici car il n'y a qu'un seul ordre dans hedge
         return;
       }
       
@@ -868,15 +974,11 @@ export class MarketMaker {
       const openOrders = await this.orderCloser.getOpenOrders();
       
       if (!openOrders || openOrders.length === 0) {
-        log.debug("🔄 No open orders from API, clearing local cache");
+        log.debug("🔄 No open orders from API, checking for in-doubt orders");
         
-        // Si l'API dit qu'il n'y a aucun ordre ouvert, nettoyer le cache local
+        // NOUVEAU : Au lieu de clear() brutal, marquer les ordres comme "inDoubt"
         if (this.activeOrders.size > 0) {
-          log.warn({
-            localOrders: this.activeOrders.size,
-            apiOrders: 0
-          }, "⚠️ Divergence detected: local cache has orders but API has none - clearing cache");
-          this.activeOrders.clear();
+          await this.handleApiOrdersZero();
         }
         return;
       }
@@ -1004,6 +1106,143 @@ export class MarketMaker {
   }
 
   /**
+   * NOUVEAU : Gère le cas où l'API retourne 0 ordres mais qu'on en a localement
+   * Au lieu de clear() brutal, on fait des rechecks et des cancels explicites
+   */
+  private async handleApiOrdersZero() {
+    const tokens = [this.marketInfo!.yesTokenId, this.marketInfo!.noTokenId];
+    
+    for (const tokenId of tokens) {
+      const localOrders = this.activeOrders.get(tokenId);
+      if (!localOrders) continue;
+      
+      const recheckKey = tokenId;
+      const currentRechecks = this.apiOrdersZeroRechecks.get(recheckKey) || 0;
+      
+      if (currentRechecks === 0) {
+        // Premier check : marquer comme inDoubt et programmer des rechecks
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          localOrders: this.activeOrders.size,
+          apiOrders: 0,
+          recheck: 1
+        }, "⚠️ API says 0 orders but we have local orders - marking in doubt, will recheck");
+        
+        this.apiOrdersZeroRechecks.set(recheckKey, 1);
+        
+        // Programmer un recheck dans 10 secondes
+        setTimeout(() => this.recheckApiOrders(tokenId), 10000);
+        
+      } else if (currentRechecks < 3) {
+        // Recheck 2 et 3 : vérifier à nouveau l'API
+        log.info({
+          tokenId: tokenId.substring(0, 20) + '...',
+          recheck: currentRechecks + 1
+        }, "🔄 Rechecking API for orders...");
+        
+        this.apiOrdersZeroRechecks.set(recheckKey, currentRechecks + 1);
+        
+        // Vérifier à nouveau l'API
+        const openOrders = await this.orderCloser.getOpenOrders();
+        const relevantOrders = openOrders?.filter((order: any) => 
+          order.asset_id === tokenId
+        ) || [];
+        
+        if (relevantOrders.length > 0) {
+          // L'API a retrouvé les ordres !
+          log.info({
+            tokenId: tokenId.substring(0, 20) + '...',
+            foundOrders: relevantOrders.length
+          }, "✅ API recheck found orders - resolving in doubt");
+          
+          this.apiOrdersZeroRechecks.delete(recheckKey);
+          return; // Pas besoin de cancel
+        }
+        
+        // Programmer le prochain recheck SEULEMENT si on n'a pas déjà fait 3 rechecks
+        if (currentRechecks + 1 < 3) {
+          setTimeout(() => this.recheckApiOrders(tokenId), 10000);
+        }
+        
+      } else if (currentRechecks === 3) {
+        // Après 3 rechecks, l'API dit toujours 0 → cancel explicite UNE SEULE FOIS
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          rechecks: currentRechecks
+        }, "⚠️ API consistently says 0 orders after 3 rechecks - sending explicit cancel");
+        
+        // Marquer comme traité pour ne pas réessayer
+        this.apiOrdersZeroRechecks.set(recheckKey, 4); // 4 = déjà envoyé le cancel
+        
+        const toCancel: string[] = [];
+        if (localOrders.bidId) toCancel.push(localOrders.bidId);
+        if (localOrders.askId) toCancel.push(localOrders.askId);
+        
+        if (toCancel.length > 0) {
+          try {
+            await this.clob.cancelOrders(toCancel);
+            log.info({
+              tokenId: tokenId.substring(0, 20) + '...',
+              canceledOrders: toCancel
+            }, "✅ Sent explicit cancel for in-doubt orders");
+            
+            // Attendre 2 secondes puis nettoyer le cache
+            setTimeout(() => {
+              this.activeOrders.delete(tokenId);
+              this.apiOrdersZeroRechecks.delete(recheckKey);
+              log.info({
+                tokenId: tokenId.substring(0, 20) + '...'
+              }, "🧹 Cleaned up cache after explicit cancel");
+            }, 2000);
+            
+          } catch (error) {
+            log.error({
+              tokenId: tokenId.substring(0, 20) + '...',
+              error
+            }, "❌ Failed to send explicit cancel");
+            // Retirer du compteur en cas d'erreur pour pouvoir réessayer
+            this.apiOrdersZeroRechecks.delete(recheckKey);
+          }
+        } else {
+          // Pas d'ordres à cancel, juste nettoyer
+          this.activeOrders.delete(tokenId);
+          this.apiOrdersZeroRechecks.delete(recheckKey);
+        }
+      }
+    }
+  }
+
+  /**
+   * NOUVEAU : Recheck l'API pour un token spécifique
+   */
+  private async recheckApiOrders(tokenId: string) {
+    if (!this.marketInfo || this.stopped) return;
+    
+    const recheckKey = tokenId;
+    const currentRechecks = this.apiOrdersZeroRechecks.get(recheckKey) || 0;
+    
+    // Ne pas recheck si on a déjà fait 3 tentatives
+    if (currentRechecks >= 3) {
+      return;
+    }
+    
+    const openOrders = await this.orderCloser.getOpenOrders();
+    const relevantOrders = openOrders?.filter((order: any) => 
+      order.asset_id === tokenId
+    ) || [];
+    
+    if (relevantOrders.length > 0) {
+      log.info({
+        tokenId: tokenId.substring(0, 20) + '...',
+        foundOrders: relevantOrders.length
+      }, "✅ Recheck found orders - resolving in doubt");
+      
+      this.apiOrdersZeroRechecks.delete(tokenId);
+    }
+    // Ne plus appeler handleApiOrdersZero ici pour éviter la boucle infinie
+  }
+
+  /**
    * Resync inventaire depuis la blockchain (fallback si UserFeed rate des fills)
    * CRITIQUE : Compare avec l'inventaire local et log les divergences
    */
@@ -1115,6 +1354,16 @@ export class MarketMaker {
     const currentOrders = this.activeOrders.get(tokenId);
     const determinedSide = tokenId === this.marketInfo.yesTokenId ? 'YES' : 'NO';
     
+    // ✅ FIX #4: Éviter le spam - ignorer si les prix n'ont pas changé depuis le dernier traitement
+    const lastProcessed = this.lastProcessedPrices.get(tokenId);
+    if (lastProcessed && lastProcessed.bestBid === bestBid && lastProcessed.bestAsk === bestAsk) {
+      // Prix identiques au dernier traitement, pas besoin de retraiter
+      return;
+    }
+    
+    // Mémoriser ces prix comme traités
+    this.lastProcessedPrices.set(tokenId, { bestBid, bestAsk });
+    
     log.info({
       tokenId: tokenId.substring(0, 20) + '...',
       bestBid: bestBid.toFixed(4),
@@ -1133,9 +1382,9 @@ export class MarketMaker {
       lastPlaceTime: currentOrders?.lastPlaceTime || 'none'
     }, "🔍 Checking active orders");
     
-    // Vérifier si on a besoin de placer des ordres (manque bidId OU askId)
-    const needsBid = !currentOrders?.bidId;
-    const needsAsk = !currentOrders?.askId;
+    // ✅ FIX #4: Vérifier le cap d'ordres par side AVANT de placer
+    const needsBid = !currentOrders?.bidId && this.canPlaceOrderOnSide(tokenId, 'bid');
+    const needsAsk = !currentOrders?.askId && this.canPlaceOrderOnSide(tokenId, 'ask');
     
     if (needsBid || needsAsk) {
       // Placer les ordres manquants avec les VRAIS prix WebSocket
@@ -1162,16 +1411,27 @@ export class MarketMaker {
     // Vérifier si nos ordres sont toujours compétitifs
     const shouldReplace = this.shouldReplaceOrders(currentOrders, bestBid, bestAsk, targetSpread);
 
-    if (shouldReplace && this.canReplaceOrders()) {
-      log.info({
-        tokenId: tokenId.substring(0, 20) + '...',
-        currentSpread: spread.toFixed(3),
-        targetSpread: targetSpread.toFixed(3),
-        currentMid: ((bestBid + bestAsk) / 2).toFixed(4),
-        lastMid: currentOrders.lastMid?.toFixed(4) || 'N/A'
-      }, "🔄 Replacing orders due to price change or competition");
+    if (shouldReplace) {
+      // ✅ FIX #3 & #6: Replace par side avec cooldown
+      const replaceBid = this.shouldReplaceSide(tokenId, 'bid', currentOrders, bestBid, bestAsk);
+      const replaceAsk = this.shouldReplaceSide(tokenId, 'ask', currentOrders, bestBid, bestAsk);
       
-      await this.replaceOrders(tokenId, { bestBid, bestAsk, tickSize: 0.001 }, determinedSide);
+      if (replaceBid || replaceAsk) {
+        log.info({
+          tokenId: tokenId.substring(0, 20) + '...',
+          currentSpread: spread.toFixed(3),
+          targetSpread: targetSpread.toFixed(3),
+          currentMid: ((bestBid + bestAsk) / 2).toFixed(4),
+          lastMid: currentOrders?.lastMid?.toFixed(4) || 'N/A',
+          replaceBid,
+          replaceAsk
+        }, "🔄 Replacing orders due to price change or competition");
+        
+        await this.replaceOrdersBySide(tokenId, { bestBid, bestAsk, tickSize: 0.001 }, determinedSide, {
+          replaceBid,
+          replaceAsk
+        });
+      }
     }
   }
 
@@ -1243,6 +1503,141 @@ export class MarketMaker {
     }
     this.lastReplaceTime = now;
     return true;
+  }
+
+  /**
+   * NOUVEAU : Valide et ajuste les prix pour éviter le crossing
+   * Retourne null si l'ordre crosserait, sinon le prix ajusté
+   */
+  private validateAntiCrossing(price: number, bestBid: number, bestAsk: number, side: 'BUY' | 'SELL'): number | null {
+    const tickSize = 0.001;
+    
+    if (side === 'BUY') {
+      // BUY ne doit pas être >= bestAsk
+      if (price >= bestAsk) {
+        const adjustedPrice = bestAsk - tickSize;
+        if (adjustedPrice <= bestBid) {
+          return null; // Pas de place pour un BUY post-only
+        }
+        return adjustedPrice;
+      }
+    } else {
+      // SELL ne doit pas être <= bestBid
+      if (price <= bestBid) {
+        const adjustedPrice = bestBid + tickSize;
+        if (adjustedPrice >= bestAsk) {
+          return null; // Pas de place pour un SELL post-only
+        }
+        return adjustedPrice;
+      }
+    }
+    
+    return price; // Prix OK
+  }
+
+  /**
+   * NOUVEAU : Vérifie si on peut placer un ordre sur un side donné
+   * Respecte MAX_ACTIVE_ORDERS_PER_SIDE
+   */
+  private canPlaceOrderOnSide(tokenId: string, side: 'bid' | 'ask'): boolean {
+    const orders = this.activeOrders.get(tokenId);
+    if (!orders) return true; // Pas d'ordres existants
+    
+    // Compter les ordres actifs sur ce side
+    const hasActiveOrder = side === 'bid' ? !!orders.bidId : !!orders.askId;
+    
+    if (hasActiveOrder) {
+      log.debug({
+        tokenId: tokenId.substring(0, 20) + '...',
+        side,
+        maxPerSide: MAX_ACTIVE_ORDERS_PER_SIDE
+      }, "🚫 Side already has active order - respecting cap");
+      return false;
+    }
+    
+    return true;
+  }
+
+  /**
+   * NOUVEAU : Vérifie si un side spécifique doit être remplacé avec cooldown par side
+   */
+  private shouldReplaceSide(tokenId: string, side: 'bid' | 'ask', currentOrders: any, bestBid: number, bestAsk: number): boolean {
+    const now = Date.now();
+    const sideKey = `${tokenId}-${side}`;
+    const lastReplaceTimes = this.lastReplaceTimeBySide.get(tokenId) || { bid: 0, ask: 0 };
+    
+    // Vérifier le cooldown pour ce side
+    const lastReplaceTime = side === 'bid' ? lastReplaceTimes.bid : lastReplaceTimes.ask;
+    if (now - lastReplaceTime < this.config.replaceCooldownMs) {
+      log.debug({
+        tokenId: tokenId.substring(0, 20) + '...',
+        side,
+        cooldownRemaining: ((this.config.replaceCooldownMs - (now - lastReplaceTime)) / 1000).toFixed(1) + 's'
+      }, "⏳ Side replace cooldown active");
+      return false;
+    }
+    
+    // Vérifier les conditions de remplacement pour ce side
+    if (side === 'bid') {
+      const ourBidIsBest = currentOrders.bidPrice && currentOrders.bidPrice >= bestBid;
+      const orderAge = now - (currentOrders.lastPlaceTime || 0);
+      const orderTooOld = orderAge > ORDER_TTL_MS;
+      
+      return !ourBidIsBest || orderTooOld;
+    } else {
+      const ourAskIsBest = currentOrders.askPrice && currentOrders.askPrice <= bestAsk;
+      const orderAge = now - (currentOrders.lastPlaceTime || 0);
+      const orderTooOld = orderAge > ORDER_TTL_MS;
+      
+      return !ourAskIsBest || orderTooOld;
+    }
+  }
+
+  /**
+   * NOUVEAU : Remplace les ordres par side au lieu de tout annuler
+   */
+  private async replaceOrdersBySide(tokenId: string, snapshot: any, tokenSide: 'YES' | 'NO', options: { replaceBid: boolean, replaceAsk: boolean }) {
+    if (!this.marketInfo) {
+      log.error("No market info available for replacement");
+      return;
+    }
+
+    const now = Date.now();
+    const sideKey = tokenId;
+    const lastReplaceTimes = this.lastReplaceTimeBySide.get(sideKey) || { bid: 0, ask: 0 };
+
+    // Annuler seulement les sides qui doivent être remplacés
+    const toCancel: string[] = [];
+    const orders = this.activeOrders.get(tokenId);
+    
+    if (options.replaceBid && orders?.bidId) {
+      toCancel.push(orders.bidId);
+      lastReplaceTimes.bid = now;
+    }
+    
+    if (options.replaceAsk && orders?.askId) {
+      toCancel.push(orders.askId);
+      lastReplaceTimes.ask = now;
+    }
+    
+    if (toCancel.length > 0) {
+      await this.clob.cancelOrders(toCancel);
+      log.info({
+        tokenId: tokenId.substring(0, 20) + '...',
+        canceledOrders: toCancel,
+        replaceBid: options.replaceBid,
+        replaceAsk: options.replaceAsk
+      }, "🗑️ Canceled orders for replacement");
+    }
+    
+    // Mettre à jour le cooldown par side
+    this.lastReplaceTimeBySide.set(sideKey, lastReplaceTimes);
+    
+    // Placer de nouveaux ordres seulement pour les sides remplacés
+    await this.placeOrders(tokenId, snapshot, tokenSide, undefined, {
+      placeBuy: options.replaceBid,
+      placeSell: options.replaceAsk
+    });
   }
 
   /**
@@ -1321,7 +1716,11 @@ export class MarketMaker {
         return;
       }
 
-      const { bidPrice, askPrice, parityBias, midPrice } = prices;
+      const { bidPrice: originalBidPrice, askPrice: originalAskPrice, parityBias, midPrice } = prices;
+      
+      // Variables modifiables pour les ajustements anti-crossing
+      let bidPrice = originalBidPrice;
+      let askPrice = originalAskPrice;
       
       // Mémoriser le mid-price pour détecter les mouvements futurs
       const existingOrders = this.activeOrders.get(tokenId) || {};
@@ -1370,7 +1769,8 @@ export class MarketMaker {
       const hasInventory = currentInventory > 0;
       
       // CORRECTION : Placer des ordres BUY même avec inventaire (pour capturer le spread)
-      const shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false);
+      // ✅ FIX: Utiliser let au lieu de const pour permettre les modifications dans la logique d'idempotence
+      let shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false);
       let shouldPlaceSell = canSell && (parityBias !== 'BUY') && (options?.placeSell !== false);
       
       // DEBUG : Vérifier chaque condition individuellement
@@ -1435,20 +1835,43 @@ export class MarketMaker {
               clientOrderId: buyOrderData.clientOrderId,
               tokenId: tokenId.substring(0, 20) + '...',
               side: "BUY"
-            }, "⚠️ Duplicate clientOrderId detected - skipping to avoid duplicate order");
-            return;
+            }, "⚠️ Duplicate BUY clientOrderId detected - skipping BUY only");
+            // ✅ FIX: Ne pas return ici, juste skip le BUY et continuer vers SELL
+            shouldPlaceBuy = false;
           }
           
-          const buyOrder = {
-            deferExec: false,
-            order: { ...buyOrderData, signature: "0x" },
-            owner: process.env.CLOB_API_KEY!,
-            orderType: "GTC" as OrderType
-          };
+          // ✅ FIX #5: Anti-crossing guard juste avant l'envoi
+          const finalBidPrice = this.validateAntiCrossing(bidPrice, snapshot.bestBid, snapshot.bestAsk, 'BUY');
+          if (finalBidPrice === null) {
+            log.warn({
+              tokenId: tokenId.substring(0, 20) + '...',
+              originalPrice: bidPrice.toFixed(4),
+              bestBid: snapshot.bestBid.toFixed(4),
+              bestAsk: snapshot.bestAsk.toFixed(4)
+            }, "🚫 BUY order would cross market - skipping");
+            shouldPlaceBuy = false;
+          } else if (finalBidPrice !== bidPrice) {
+            log.info({
+              tokenId: tokenId.substring(0, 20) + '...',
+              originalPrice: bidPrice.toFixed(4),
+              adjustedPrice: finalBidPrice.toFixed(4),
+              reason: "Anti-crossing adjustment"
+            }, "🔧 Adjusted BUY price to avoid crossing");
+            bidPrice = finalBidPrice;
+          }
 
-          // LOGS FORENSICS : Capture complète au moment du placement
-          log.info({
-            event: "place_attempt",
+          // ✅ FIX: Vérifier à nouveau si on doit placer le BUY
+          if (shouldPlaceBuy) {
+            const buyOrder = {
+              deferExec: false,
+              order: { ...buyOrderData, signature: "0x" },
+              owner: process.env.CLOB_API_KEY!,
+              orderType: "GTC" as OrderType
+            };
+
+            // LOGS FORENSICS : Capture complète au moment du placement
+            log.info({
+              event: "place_attempt",
             slug: this.marketInfo.slug,
             tokenId: tokenId.substring(0, 20) + '...',
             tokenSide,
@@ -1498,6 +1921,9 @@ export class MarketMaker {
               bidClientOrderId: buyOrderData.clientOrderId
             });
             
+            // ✅ FIX #9: Ajouter l'ordre au tracking UserFeed
+            this.userFeed.addLocalOrderId(orderId);
+            
             // LOGS FORENSICS : Confirmation du placement
             log.info({ 
               event: "order_ack",
@@ -1512,6 +1938,7 @@ export class MarketMaker {
               timestamp: new Date().toISOString()
             }, "✅ BUY order POSTED (inventory will update on fill)");
           }
+          } // ✅ FIX: Fin du bloc if (shouldPlaceBuy) imbriqué
         } catch (error: any) {
           // Logs HTTP enrichis pour debug des erreurs 403/429/400
           const httpStatus = error.response?.status || error.status;
@@ -1607,21 +2034,43 @@ export class MarketMaker {
               clientOrderId: sellOrderData.clientOrderId,
               tokenId: tokenId.substring(0, 20) + '...',
               side: "SELL"
-            }, "⚠️ Duplicate clientOrderId detected - skipping to avoid duplicate order");
+            }, "⚠️ Duplicate SELL clientOrderId detected - skipping SELL only");
+            // ✅ FIX: Ne pas return ici, juste skip le SELL
             shouldPlaceSell = false;
-            return;
           }
           
-          const sellOrder = {
-            deferExec: false,
-            order: { ...sellOrderData, signature: "0x" },
-            owner: process.env.CLOB_API_KEY!,
-            orderType: "GTC" as OrderType
-          };
+          // ✅ FIX #5: Anti-crossing guard juste avant l'envoi
+          const finalAskPrice = this.validateAntiCrossing(askPrice, snapshot.bestBid, snapshot.bestAsk, 'SELL');
+          if (finalAskPrice === null) {
+            log.warn({
+              tokenId: tokenId.substring(0, 20) + '...',
+              originalPrice: askPrice.toFixed(4),
+              bestBid: snapshot.bestBid.toFixed(4),
+              bestAsk: snapshot.bestAsk.toFixed(4)
+            }, "🚫 SELL order would cross market - skipping");
+            shouldPlaceSell = false;
+          } else if (finalAskPrice !== askPrice) {
+            log.info({
+              tokenId: tokenId.substring(0, 20) + '...',
+              originalPrice: askPrice.toFixed(4),
+              adjustedPrice: finalAskPrice.toFixed(4),
+              reason: "Anti-crossing adjustment"
+            }, "🔧 Adjusted SELL price to avoid crossing");
+            askPrice = finalAskPrice;
+          }
 
-          // LOGS FORENSICS : Capture complète au moment du placement
-          log.info({
-            event: "place_attempt",
+          // ✅ FIX: Vérifier à nouveau si on doit placer le SELL
+          if (shouldPlaceSell) {
+            const sellOrder = {
+              deferExec: false,
+              order: { ...sellOrderData, signature: "0x" },
+              owner: process.env.CLOB_API_KEY!,
+              orderType: "GTC" as OrderType
+            };
+
+            // LOGS FORENSICS : Capture complète au moment du placement
+            log.info({
+              event: "place_attempt",
             slug: this.marketInfo.slug,
             tokenId: tokenId.substring(0, 20) + '...',
             tokenSide,
@@ -1671,6 +2120,9 @@ export class MarketMaker {
               askClientOrderId: sellOrderData.clientOrderId
             });
             
+            // ✅ FIX #9: Ajouter l'ordre au tracking UserFeed
+            this.userFeed.addLocalOrderId(orderId);
+            
             // LOGS FORENSICS : Confirmation du placement
             log.info({ 
               event: "order_ack",
@@ -1685,6 +2137,7 @@ export class MarketMaker {
               timestamp: new Date().toISOString()
             }, "✅ SELL order POSTED (inventory will update on fill)");
           }
+          } // ✅ FIX: Fin du bloc if (shouldPlaceSell) imbriqué
           }
         } catch (error: any) {
           // Logs HTTP enrichis pour debug des erreurs 403/429/400
@@ -2320,6 +2773,9 @@ export class MarketMaker {
     }
     if (this.marketHealthCheckInterval) {
       clearInterval(this.marketHealthCheckInterval);
+    }
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
     }
     
     // Annuler tous les ordres actifs

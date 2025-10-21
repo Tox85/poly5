@@ -20,13 +20,13 @@ export type FillEvent = {
 };
 
 export type OrderEvent = {
-  type: "order";
+  type: "order" | "order_status";
   orderId: string;
   status: "LIVE" | "MATCHED" | "CANCELLED" | "DELAYED";
-  asset: string;
-  side: "BUY" | "SELL";
-  price: string;
-  originalSize: string;
+  asset?: string;
+  side?: "BUY" | "SELL";
+  price?: string;
+  originalSize?: string;
   sizeMatched?: string;
   timestamp: number;
 };
@@ -41,17 +41,22 @@ export class UserFeed {
   private maxReconnectAttempts = 10;
   private isConnecting = false;
   
+  // ✅ FIX #9: Tracking des ordres locaux pour le mini-resync
+  private localOrderIds = new Set<string>();
+  private clobClient: any; // Référence au client CLOB pour les appels REST
+  
   // Auth L2 comme pour REST API
   private apiKey: string;
   private apiSecret: string;
   private passphrase: string;
   private signingKey: string;
 
-  constructor(apiKey: string, apiSecret: string, passphrase: string, signingKey: string) {
+  constructor(apiKey: string, apiSecret: string, passphrase: string, signingKey: string, clobClient?: any) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
     this.passphrase = passphrase;
     this.signingKey = signingKey;
+    this.clobClient = clobClient; // ✅ FIX #9: Stocker la référence CLOB
   }
 
   /**
@@ -109,6 +114,9 @@ export class UserFeed {
       
       log.info("✅ User WebSocket connected - ready to receive fills, orders, balance updates");
       
+      // ✅ FIX #9: Mini-resync après reconnexion
+      this.performMiniResync();
+      
       // Ping périodique
       this.ping = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
@@ -139,7 +147,9 @@ export class UserFeed {
         }, "🔍 UserFeed message received");
         
         // Fill event (ordre exécuté totalement ou partiellement)
-        if (msg.event_type === "match" || msg.type === "fill" || msg.event_type === "fill") {
+        // ✅ FIX #8: Capturer aussi les événements "trade" qui contiennent les fills partiels
+        if (msg.event_type === "match" || msg.type === "fill" || msg.event_type === "fill" || 
+            msg.event_type === "trade" || msg.type === "trade") {
           const fill: FillEvent = {
             type: "fill",
             orderId: msg.order_id || msg.orderId,
@@ -147,19 +157,30 @@ export class UserFeed {
             market: msg.market,
             side: msg.side?.toUpperCase() as "BUY" | "SELL",
             price: msg.price,
-            size: msg.size || msg.size_matched,
-            fee: msg.fee_rate_bps ? (parseFloat(msg.price) * parseFloat(msg.size) * parseFloat(msg.fee_rate_bps) / 10000).toString() : "0",
+            size: msg.size || msg.size_matched || msg.amount, // ✅ FIX: Essayer aussi msg.amount
+            fee: msg.fee_rate_bps ? (parseFloat(msg.price) * parseFloat(msg.size || msg.amount || "0") * parseFloat(msg.fee_rate_bps) / 10000).toString() : "0",
             timestamp: msg.timestamp || Date.now(),
             status: "MATCHED"
           };
           
+          // ✅ FIX #8: Valider que le fill a des données complètes
+          if (!fill.orderId || !fill.asset || !fill.side || !fill.price || !fill.size) {
+            log.warn({
+              rawMessage: JSON.stringify(msg).substring(0, 200),
+              reason: "Incomplete fill data"
+            }, "⚠️ Skipping incomplete fill event");
+            return;
+          }
+          
           log.info({
+            event: "fill_detected",
             orderId: fill.orderId.substring(0, 16) + '...',
             side: fill.side,
             price: fill.price,
             size: fill.size,
-            asset: fill.asset.substring(0, 20) + '...'
-          }, "💰 FILL EVENT");
+            asset: fill.asset.substring(0, 20) + '...',
+            timestamp: new Date(fill.timestamp).toISOString()
+          }, "💰 FILL EVENT DETECTED");
           
           this.fillListeners.forEach(listener => listener(fill));
         }
@@ -266,6 +287,83 @@ export class UserFeed {
     this.isConnecting = false;
     this.reconnectAttempts = 0;
     log.info("User WebSocket disconnected");
+  }
+
+  /**
+   * NOUVEAU : Ajoute un orderId au tracking local
+   */
+  addLocalOrderId(orderId: string) {
+    this.localOrderIds.add(orderId);
+  }
+
+  /**
+   * NOUVEAU : Retire un orderId du tracking local
+   */
+  removeLocalOrderId(orderId: string) {
+    this.localOrderIds.delete(orderId);
+  }
+
+  /**
+   * NOUVEAU : Mini-resync après reconnexion WebSocket
+   * Vérifie le statut des ordres locaux via REST API
+   */
+  private async performMiniResync() {
+    if (!this.clobClient || this.localOrderIds.size === 0) {
+      return;
+    }
+
+    log.info({
+      localOrderCount: this.localOrderIds.size
+    }, "🔄 Performing mini-resync after WebSocket reconnection");
+
+    try {
+      // Récupérer les ordres ouverts depuis l'API REST
+      const openOrders = await this.clobClient.getOpenOrders();
+      
+      if (!openOrders || openOrders.length === 0) {
+        log.warn("🔄 No open orders from API during mini-resync");
+        return;
+      }
+
+      const openOrderIds = new Set(openOrders.map((order: any) => order.id || order.orderId));
+
+      // Vérifier chaque ordre local
+      for (const localOrderId of this.localOrderIds) {
+        if (openOrderIds.has(localOrderId)) {
+          // Ordre toujours ouvert - émettre un événement LIVE
+          this.orderListeners.forEach(listener => {
+            listener({
+              type: "order_status",
+              orderId: localOrderId,
+              status: "LIVE",
+              timestamp: Date.now()
+            });
+          });
+        } else {
+          // Ordre fermé - émettre un événement CANCELLED
+          this.orderListeners.forEach(listener => {
+            listener({
+              type: "order_status",
+              orderId: localOrderId,
+              status: "CANCELLED",
+              timestamp: Date.now()
+            });
+          });
+          this.localOrderIds.delete(localOrderId);
+        }
+      }
+
+      log.info({
+        syncedOrders: this.localOrderIds.size,
+        totalOpenOrders: openOrders.length
+      }, "✅ Mini-resync completed");
+
+    } catch (error: any) {
+      log.error({
+        error: error.message,
+        localOrderCount: this.localOrderIds.size
+      }, "❌ Mini-resync failed");
+    }
   }
 }
 

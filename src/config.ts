@@ -19,6 +19,7 @@ export const TARGET_SPREAD_CENTS = Number(process.env.TARGET_SPREAD_CENTS) || 3;
 export const TICK_IMPROVEMENT = Number(process.env.TICK_IMPROVEMENT) || 1; // 1 tick = 0.1¢ d'amélioration (priorité de file)
 export const NOTIONAL_PER_ORDER_USDC = Number(process.env.NOTIONAL_PER_ORDER_USDC) || 1.5; // Réduit à 1.5$ pour économiser le capital
 export const MAX_ACTIVE_ORDERS = Number(process.env.MAX_ACTIVE_ORDERS) || 100;
+export const MAX_ACTIVE_ORDERS_PER_SIDE = Number(process.env.MAX_ACTIVE_ORDERS_PER_SIDE) || 1;
 export const REPLACE_COOLDOWN_MS = Number(process.env.REPLACE_COOLDOWN_MS) || 1500;
 export const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS) || 30000;
 export const PRICE_CHANGE_THRESHOLD = Number(process.env.PRICE_CHANGE_THRESHOLD) || 0.001;
@@ -62,7 +63,8 @@ export const AUTO_ADJUST_NOTIONAL = process.env.AUTO_ADJUST_NOTIONAL === 'true';
 export const MAX_DISTANCE_FROM_MID = Number(process.env.MAX_DISTANCE_FROM_MID) || 0.05; // 5¢ - distance max du mid-price
 export const MAX_ACTIVE_MARKETS = Number(process.env.MAX_ACTIVE_MARKETS) || 2; // Nombre maximum de marchés actifs (2 pour avoir un fallback)
 export const MIN_VOLUME_USDC = Number(process.env.MIN_VOLUME_USDC) || 5000; // Volume minimum 24h en USDC
-export const MIN_SPREAD_CENTS = Number(process.env.MIN_SPREAD_CENTS) || 0.1; // Spread minimum requis en centimes (0.1¢ = très serré, 0.5¢ = large)
+// ✅ FIX #9: Réduire à 0.5¢ pour accepter plus de marchés (les spreads serrés sont profitables)
+export const MIN_SPREAD_CENTS = Number(process.env.MIN_SPREAD_CENTS) || 0.5; // Spread minimum requis en centimes
 export const MAX_SPREAD_CENTS = Number(process.env.MAX_SPREAD_CENTS) || 10; // Spread maximum accepté en centimes (10¢ = large mais réaliste)
 
 // Configuration du capital à risque

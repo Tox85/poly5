@@ -220,6 +220,9 @@ async function main() {
   let running: { mm: MarketMaker; slug: string }[] = [];
   let activeMarketMakers = 0;
   
+  // ✅ FIX #8: Mutex pour éviter les double démarrages
+  const runningMarkets = new Set<string>();
+  
   for (const market of picked) {
     log.info({ 
       market: market.slug, 
@@ -283,14 +286,32 @@ async function main() {
       // 4) Si on a de la place, on démarre de nouveaux marchés
       const capacity = MAX_ACTIVE_MARKETS - active.length;
       for (const mkt of pool.slice(0, Math.max(0, capacity))) {
+        // ✅ FIX #8: Vérifier le mutex avant de démarrer
+        if (runningMarkets.has(mkt.slug)) {
+          log.debug({ slug: mkt.slug }, "🚫 Market already running - skipping");
+          continue;
+        }
+        
         const mm = new MarketMaker(mmConfig);
-        mm.start(mkt).catch(err => log.error({ err, slug: mkt.slug }, "Rotation start failed"));
+        runningMarkets.add(mkt.slug); // Marquer comme en cours de démarrage
+        
+        mm.start(mkt).catch(err => {
+          log.error({ err, slug: mkt.slug }, "Rotation start failed");
+          runningMarkets.delete(mkt.slug); // Retirer du mutex en cas d'erreur
+        });
+        
         running.push({ mm, slug: mkt.slug });
         log.info({ slug: mkt.slug }, "🔁 Rotation: started new market");
       }
 
       // 5) Nettoyage de la liste (retire les stoppés)
-      running = running.filter(r => !r.mm.isStopped());
+      running = running.filter(r => {
+        if (r.mm.isStopped()) {
+          runningMarkets.delete(r.slug); // ✅ FIX #8: Retirer du mutex quand arrêté
+          return false;
+        }
+        return true;
+      });
       
       log.debug({ 
         active: active.length, 

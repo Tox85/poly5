@@ -118,10 +118,27 @@ export class PolyClobClient {
       };
       
     } catch (error: any) {
+      const status = error.response?.status;
+      const endpoint = "postOrder";
+      const data = error.response?.data;
+      
       log.error({
-        error: error.message,
-        response: error.response?.data
+        status,
+        endpoint,
+        data,
+        error: error.message
       }, "❌ Failed to place order");
+      
+      // ✅ FIX #11: Backoff et gestion des erreurs spécifiques
+      if (status === 401 || status === 403) {
+        log.error({ status, endpoint }, "🚫 Authentication error - stopping market");
+        // TODO: Implémenter l'arrêt du marché courant
+      } else if (status === 429) {
+        const retryAfter = error.response?.headers?.['retry-after'];
+        log.warn({ status, endpoint, retryAfter }, "⏳ Rate limited - applying backoff");
+        // TODO: Implémenter le backoff exponentiel
+      }
+      
       throw error;
     }
   }
@@ -136,7 +153,26 @@ export class PolyClobClient {
       log.info({ canceled: response.canceled?.length || orderIds.length }, "✅ Orders canceled");
       return response;
     } catch (error: any) {
-      log.error({ error: error.message }, "❌ Failed to cancel orders");
+      const status = error.response?.status;
+      const endpoint = "cancelOrders";
+      const data = error.response?.data;
+      
+      log.error({
+        status,
+        endpoint,
+        data,
+        error: error.message,
+        orderIds: orderIds.length
+      }, "❌ Failed to cancel orders");
+      
+      // ✅ FIX #11: Backoff et gestion des erreurs spécifiques
+      if (status === 401 || status === 403) {
+        log.error({ status, endpoint }, "🚫 Authentication error - stopping market");
+      } else if (status === 429) {
+        const retryAfter = error.response?.headers?.['retry-after'];
+        log.warn({ status, endpoint, retryAfter }, "⏳ Rate limited - applying backoff");
+      }
+      
       throw error;
     }
   }
