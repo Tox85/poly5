@@ -77,6 +77,10 @@ function buildOrder(
   // Générer un salt unique basé sur le timestamp + random pour éviter les collisions
   const uniqueSalt = Date.now() * 1000 + Math.floor(Math.random() * 1000);
 
+  // IDEMPOTENCE : Générer un clientOrderId unique pour éviter les doublons
+  // Format: side-tokenId(court)-price-timestamp
+  const clientOrderId = `${side}-${tokenId.substring(0, 10)}-${price.toFixed(4)}-${Date.now()}`;
+
   return {
     // champs du PostOrder → cf. docs "Place Single Order"
     salt: uniqueSalt, // Salt unique pour chaque ordre
@@ -91,6 +95,7 @@ function buildOrder(
     nonce: "0",      // Nonce par défaut
     feeRateBps: "0",
     signatureType: SignatureType.EOA, // 0 = EOA (même avec proxy Polymarket !)
+    clientOrderId, // NOUVEAU : ID unique pour éviter les doublons
   };
 }
 
@@ -137,7 +142,10 @@ export class MarketMaker {
     askSize?: number;
     lastMid?: number;
     lastPlaceTime?: number;
+    bidClientOrderId?: string; // NOUVEAU : Pour idempotence
+    askClientOrderId?: string; // NOUVEAU : Pour idempotence
   }>();
+  private placedClientOrderIds = new Set<string>(); // NOUVEAU : Tracking des IDs déjà utilisés
   private lastReplaceTime = 0;
   private marketInfo: MarketInfo | null = null;
   private lastPlaceTime = 0; // Anti-spam pour les logs
@@ -585,8 +593,149 @@ export class MarketMaker {
     // Forcer refresh de l'allowance USDC (le solde a changé)
     this.allowanceManager.forceUsdcCheck();
     
-    // RÉACTIVITÉ POST-FILL : Tenter la jambe opposée
-    this.tryQuoteOppositeSide(tokenId, fill.side);
+    // HEDGE AUTOMATIQUE : Placer un ordre inverse pour neutraliser l'exposition
+    this.placeHedgeOrder(tokenId, fill.side, price, size);
+    
+    // RÉACTIVITÉ POST-FILL : Tenter la jambe opposée (désactivé car remplacé par hedge)
+    // this.tryQuoteOppositeSide(tokenId, fill.side);
+  }
+  
+  /**
+   * Place automatiquement un ordre inverse après un fill pour neutraliser l'exposition
+   * HEDGE: Si on a acheté (BUY fill), on place un SELL. Si on a vendu (SELL fill), on place un BUY.
+   */
+  private async placeHedgeOrder(tokenId: string, filledSide: "BUY" | "SELL", filledPrice: number, filledSize: number): Promise<void> {
+    if (!this.marketInfo || this.config.dryRun) return;
+    
+    try {
+      // Déterminer le côté du hedge (inverse du fill)
+      const hedgeSide: "BUY" | "SELL" = filledSide === "BUY" ? "SELL" : "BUY";
+      
+      // Récupérer les prix actuels depuis le cache
+      const lastPrices = this.feed.getLastPrices(tokenId);
+      if (!lastPrices || lastPrices.bestBid === null || lastPrices.bestAsk === null) {
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          reason: "No current prices available"
+        }, "⚠️ Cannot place hedge order - no prices");
+        return;
+      }
+      
+      const { bestBid, bestAsk } = lastPrices;
+      
+      // Calculer le prix du hedge avec un spread favorable
+      // Si on hedge un BUY (donc on SELL), on veut vendre au-dessus du prix d'achat
+      // Si on hedge un SELL (donc on BUY), on veut acheter en-dessous du prix de vente
+      let hedgePrice: number;
+      
+      if (hedgeSide === "SELL") {
+        // On veut vendre au moins au prix qu'on a payé + 1 tick pour capturer le spread
+        hedgePrice = Math.max(filledPrice + 0.001, bestAsk);
+        
+        // Vérifier qu'on a assez d'inventaire pour le hedge
+        const currentInventory = this.inventory.getInventory(tokenId);
+        if (currentInventory < filledSize) {
+          log.warn({
+            tokenId: tokenId.substring(0, 20) + '...',
+            currentInventory: currentInventory.toFixed(2),
+            requiredSize: filledSize.toFixed(2)
+          }, "⚠️ Insufficient inventory for hedge SELL - skipping");
+          return;
+        }
+      } else {
+        // On veut acheter au plus au prix qu'on a vendu - 1 tick pour capturer le spread
+        hedgePrice = Math.min(filledPrice - 0.001, bestBid);
+      }
+      
+      // S'assurer que le prix est valide et post-only
+      if (hedgeSide === "BUY" && hedgePrice >= bestAsk) {
+        hedgePrice = bestAsk - 0.001;
+      } else if (hedgeSide === "SELL" && hedgePrice <= bestBid) {
+        hedgePrice = bestBid + 0.001;
+      }
+      
+      // Valider le prix final
+      if (hedgePrice <= 0 || hedgePrice >= 1) {
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          hedgePrice,
+          hedgeSide
+        }, "⚠️ Invalid hedge price - skipping");
+        return;
+      }
+      
+      // Construire et placer l'ordre de hedge
+      const maker = this.clob.getMakerAddress();
+      const signer = this.clob.getAddress();
+      const hedgeOrderData = buildOrder(hedgeSide, tokenId, hedgePrice, filledSize, maker, signer);
+      
+      // Vérifier l'idempotence
+      if (this.placedClientOrderIds.has(hedgeOrderData.clientOrderId)) {
+        log.warn({
+          clientOrderId: hedgeOrderData.clientOrderId,
+          tokenId: tokenId.substring(0, 20) + '...',
+          side: hedgeSide
+        }, "⚠️ Duplicate hedge clientOrderId - skipping");
+        return;
+      }
+      
+      const hedgeOrder = {
+        deferExec: false,
+        order: { ...hedgeOrderData, signature: "0x" },
+        owner: process.env.CLOB_API_KEY!,
+        orderType: "GTC" as OrderType
+      };
+      
+      log.info({
+        event: "hedge_attempt",
+        slug: this.marketInfo.slug,
+        tokenId: tokenId.substring(0, 20) + '...',
+        filledSide,
+        filledPrice: filledPrice.toFixed(4),
+        filledSize: filledSize.toFixed(2),
+        hedgeSide,
+        hedgePrice: hedgePrice.toFixed(4),
+        hedgeSize: filledSize.toFixed(2),
+        spread: (hedgePrice - filledPrice).toFixed(4),
+        timestamp: new Date().toISOString()
+      }, "🔄 Placing HEDGE order to neutralize exposure");
+      
+      const hedgeResp = await this.clob.postOrder(hedgeOrder);
+      
+      if (hedgeResp && (hedgeResp.orderId || hedgeResp.orderID)) {
+        const orderId = hedgeResp.orderId || hedgeResp.orderID;
+        
+        // Stocker le clientOrderId
+        this.placedClientOrderIds.add(hedgeOrderData.clientOrderId);
+        
+        log.info({
+          event: "hedge_placed",
+          slug: this.marketInfo.slug,
+          tokenId: tokenId.substring(0, 20) + '...',
+          orderId,
+          hedgeSide,
+          hedgePrice: hedgePrice.toFixed(4),
+          hedgeSize: filledSize.toFixed(2),
+          expectedProfit: ((hedgePrice - filledPrice) * filledSize).toFixed(4),
+          timestamp: new Date().toISOString()
+        }, "✅ HEDGE order placed successfully");
+      }
+      
+    } catch (error: any) {
+      const httpStatus = error.response?.status || error.status;
+      const httpData = error.response?.data || error.data;
+      
+      log.error({
+        event: "hedge_error",
+        slug: this.marketInfo.slug,
+        tokenId: tokenId.substring(0, 20) + '...',
+        filledSide,
+        httpStatus,
+        httpData: JSON.stringify(httpData),
+        errorMessage: error.message,
+        timestamp: new Date().toISOString()
+      }, "❌ Error placing hedge order");
+    }
   }
   
   /**
@@ -707,6 +856,13 @@ export class MarketMaker {
     
     try {
       log.debug("🔄 Starting orders reconciliation...");
+      
+      // NOUVEAU : Vérifier et cancel les ordres expirés AVANT la réconciliation
+      // Cela garantit que le TTL fonctionne même si le prix ne bouge pas
+      const tokens = [this.marketInfo.yesTokenId, this.marketInfo.noTokenId];
+      for (const tokenId of tokens) {
+        await this.cancelExpiredOrders(tokenId);
+      }
       
       // Récupérer les ordres ouverts depuis l'API REST (source de vérité)
       const openOrders = await this.orderCloser.getOpenOrders();
@@ -1141,7 +1297,10 @@ export class MarketMaker {
     if (!this.marketInfo) return;
 
     try {
-      // Vérifier le capital à risque AVANT de placer des ordres
+      // TTL: Annuler les ordres expirés AVANT de placer de nouveaux ordres
+      await this.cancelExpiredOrders(tokenId);
+      
+      // Vérifier le capital à risque APRÈS avoir annulé les ordres expirés
       const currentNotionalAtRisk = this.getNotionalAtRisk();
       if (currentNotionalAtRisk >= MAX_NOTIONAL_AT_RISK_USDC) {
         log.warn({
@@ -1270,6 +1429,16 @@ export class MarketMaker {
           const buyAmounts = buildAmounts("BUY", bidPrice, buySize!);
           const buyOrderData = buildOrder("BUY", tokenId, bidPrice, buySize!, maker, signer);
           
+          // IDEMPOTENCE : Vérifier si le clientOrderId existe déjà
+          if (this.placedClientOrderIds.has(buyOrderData.clientOrderId)) {
+            log.warn({
+              clientOrderId: buyOrderData.clientOrderId,
+              tokenId: tokenId.substring(0, 20) + '...',
+              side: "BUY"
+            }, "⚠️ Duplicate clientOrderId detected - skipping to avoid duplicate order");
+            return;
+          }
+          
           const buyOrder = {
             deferExec: false,
             order: { ...buyOrderData, signature: "0x" },
@@ -1295,10 +1464,28 @@ export class MarketMaker {
             timestamp: new Date().toISOString()
           }, "📤 Placing BUY order (solvent + can buy)");
 
+          // DRY RUN: Ne pas placer d'ordres en mode dry-run
+          if (this.config.dryRun) {
+            log.info({
+              event: "dry_run_skip",
+              slug: this.marketInfo.slug,
+              tokenId: tokenId.substring(0, 20) + '...',
+              tokenSide,
+              side: "BUY",
+              price: bidPrice.toFixed(4),
+              size: buySize,
+              notional: (bidPrice * buySize!).toFixed(2)
+            }, "[DRY_RUN] Would place BUY order");
+            return;
+          }
+
           buyResp = await this.clob.postOrder(buyOrder);
 
           if (buyResp && (buyResp.orderId || buyResp.orderID)) {
             const orderId = buyResp.orderId || buyResp.orderID;
+            
+            // Stocker le clientOrderId pour éviter les doublons futurs
+            this.placedClientOrderIds.add(buyOrderData.clientOrderId);
             
             // Stocker l'ordre actif (sera mis à jour sur fill via UserFeed)
             const existing = this.activeOrders.get(tokenId) || {};
@@ -1307,7 +1494,8 @@ export class MarketMaker {
               bidId: orderId, 
               bidPrice,
               bidSize: buySize!,
-              lastPlaceTime: Date.now()
+              lastPlaceTime: Date.now(),
+              bidClientOrderId: buyOrderData.clientOrderId
             });
             
             // LOGS FORENSICS : Confirmation du placement
@@ -1324,8 +1512,42 @@ export class MarketMaker {
               timestamp: new Date().toISOString()
             }, "✅ BUY order POSTED (inventory will update on fill)");
           }
-        } catch (error) {
-          log.error({ error, tokenId: tokenId.substring(0, 20) + '...', tokenSide, side: "BUY" }, "❌ Error placing BUY order");
+        } catch (error: any) {
+          // Logs HTTP enrichis pour debug des erreurs 403/429/400
+          const httpStatus = error.response?.status || error.status;
+          const httpData = error.response?.data || error.data;
+          const httpMessage = error.message || "Unknown error";
+          
+          log.error({
+            event: "order_placement_error",
+            slug: this.marketInfo.slug,
+            tokenId: tokenId.substring(0, 20) + '...',
+            tokenSide,
+            side: "BUY",
+            price: bidPrice.toFixed(4),
+            size: buySize,
+            httpStatus,
+            httpData: JSON.stringify(httpData),
+            httpMessage,
+            errorType: error.constructor.name,
+            timestamp: new Date().toISOString()
+          }, "❌ Error placing BUY order - HTTP details captured");
+          
+          // Si erreur 429 (rate limit), attendre avant de continuer
+          if (httpStatus === 429) {
+            log.warn({
+              slug: this.marketInfo.slug,
+              retryAfter: error.response?.headers?.['retry-after'] || 'unknown'
+            }, "⏸️ Rate limit hit (429) - backing off");
+          }
+          
+          // Si erreur 403, c'est probablement un problème d'auth
+          if (httpStatus === 403) {
+            log.error({
+              slug: this.marketInfo.slug,
+              reason: "Possible authentication issue or insufficient permissions"
+            }, "🔒 Forbidden (403) - check API credentials");
+          }
         }
       } else {
         let reason = "unknown";
@@ -1379,6 +1601,17 @@ export class MarketMaker {
           const sellAmounts = buildAmounts("SELL", askPrice, sellSize!);
           const sellOrderData = buildOrder("SELL", tokenId, askPrice, sellSize!, maker, signer);
           
+          // IDEMPOTENCE : Vérifier si le clientOrderId existe déjà
+          if (this.placedClientOrderIds.has(sellOrderData.clientOrderId)) {
+            log.warn({
+              clientOrderId: sellOrderData.clientOrderId,
+              tokenId: tokenId.substring(0, 20) + '...',
+              side: "SELL"
+            }, "⚠️ Duplicate clientOrderId detected - skipping to avoid duplicate order");
+            shouldPlaceSell = false;
+            return;
+          }
+          
           const sellOrder = {
             deferExec: false,
             order: { ...sellOrderData, signature: "0x" },
@@ -1404,10 +1637,28 @@ export class MarketMaker {
             timestamp: new Date().toISOString()
           }, "📤 Placing SELL order (solvent + can sell)");
 
+          // DRY RUN: Ne pas placer d'ordres en mode dry-run
+          if (this.config.dryRun) {
+            log.info({
+              event: "dry_run_skip",
+              slug: this.marketInfo.slug,
+              tokenId: tokenId.substring(0, 20) + '...',
+              tokenSide,
+              side: "SELL",
+              price: askPrice.toFixed(4),
+              size: sellSize,
+              notional: (askPrice * sellSize!).toFixed(2)
+            }, "[DRY_RUN] Would place SELL order");
+            return;
+          }
+
           sellResp = await this.clob.postOrder(sellOrder);
 
           if (sellResp && (sellResp.orderId || sellResp.orderID)) {
             const orderId = sellResp.orderId || sellResp.orderID;
+            
+            // Stocker le clientOrderId pour éviter les doublons futurs
+            this.placedClientOrderIds.add(sellOrderData.clientOrderId);
             
             // Stocker l'ordre actif (sera mis à jour sur fill via UserFeed)
             const existing = this.activeOrders.get(tokenId) || {};
@@ -1416,7 +1667,8 @@ export class MarketMaker {
               askId: orderId, 
               askPrice,
               askSize: sellSize!,
-              lastPlaceTime: Date.now()
+              lastPlaceTime: Date.now(),
+              askClientOrderId: sellOrderData.clientOrderId
             });
             
             // LOGS FORENSICS : Confirmation du placement
@@ -1434,8 +1686,42 @@ export class MarketMaker {
             }, "✅ SELL order POSTED (inventory will update on fill)");
           }
           }
-        } catch (error) {
-          log.error({ error, tokenId: tokenId.substring(0, 20) + '...', tokenSide, side: "SELL" }, "❌ Error placing SELL order");
+        } catch (error: any) {
+          // Logs HTTP enrichis pour debug des erreurs 403/429/400
+          const httpStatus = error.response?.status || error.status;
+          const httpData = error.response?.data || error.data;
+          const httpMessage = error.message || "Unknown error";
+          
+          log.error({
+            event: "order_placement_error",
+            slug: this.marketInfo.slug,
+            tokenId: tokenId.substring(0, 20) + '...',
+            tokenSide,
+            side: "SELL",
+            price: askPrice.toFixed(4),
+            size: sellSize,
+            httpStatus,
+            httpData: JSON.stringify(httpData),
+            httpMessage,
+            errorType: error.constructor.name,
+            timestamp: new Date().toISOString()
+          }, "❌ Error placing SELL order - HTTP details captured");
+          
+          // Si erreur 429 (rate limit), attendre avant de continuer
+          if (httpStatus === 429) {
+            log.warn({
+              slug: this.marketInfo.slug,
+              retryAfter: error.response?.headers?.['retry-after'] || 'unknown'
+            }, "⏸️ Rate limit hit (429) - backing off");
+          }
+          
+          // Si erreur 403, c'est probablement un problème d'auth
+          if (httpStatus === 403) {
+            log.error({
+              slug: this.marketInfo.slug,
+              reason: "Possible authentication issue or insufficient permissions"
+            }, "🔒 Forbidden (403) - check API credentials");
+          }
         }
       } else {
         let reason = "unknown";
@@ -1926,18 +2212,90 @@ export class MarketMaker {
     await this.placeOrders(tokenId, snapshot, tokenSide);
   }
 
+  /**
+   * Annule les ordres expirés (TTL dépassé) pour un token donné
+   * CRITIQUE: Empêche l'accumulation d'ordres fantômes
+   */
+  private async cancelExpiredOrders(tokenId: string): Promise<void> {
+    const orders = this.activeOrders.get(tokenId);
+    if (!orders) return;
+
+    const now = Date.now();
+    const orderAge = now - (orders.lastPlaceTime || 0);
+    
+    // Si l'ordre est plus vieux que le TTL, le cancel
+    if (orderAge > ORDER_TTL_MS) {
+      const toCancel: string[] = [];
+      
+      if (orders.bidId) {
+        toCancel.push(orders.bidId);
+      }
+      if (orders.askId) {
+        toCancel.push(orders.askId);
+      }
+      
+      if (toCancel.length > 0) {
+        try {
+          log.info({
+            tokenId: tokenId.substring(0, 20) + '...',
+            orderAge: (orderAge / 1000).toFixed(1) + 's',
+            ttl: (ORDER_TTL_MS / 1000).toFixed(1) + 's',
+            ordersToCancel: toCancel.length
+          }, "⏰ Canceling expired orders (TTL reached)");
+          
+          await this.clob.cancelOrders(toCancel);
+          
+          // Nettoyer le cache et les clientOrderIds
+          if (orders.bidClientOrderId) {
+            this.placedClientOrderIds.delete(orders.bidClientOrderId);
+          }
+          if (orders.askClientOrderId) {
+            this.placedClientOrderIds.delete(orders.askClientOrderId);
+          }
+          
+          this.activeOrders.delete(tokenId);
+          
+          log.info({
+            tokenId: tokenId.substring(0, 20) + '...',
+            canceled: toCancel.length
+          }, "✅ Expired orders canceled successfully");
+        } catch (error) {
+          log.error({ 
+            error, 
+            tokenId: tokenId.substring(0, 20) + '...',
+            ordersToCancel: toCancel.length
+          }, "❌ Error canceling expired orders");
+        }
+      }
+    }
+  }
+
   private async cancelOrders(tokenId: string) {
     const orders = this.activeOrders.get(tokenId);
-    if (!orders?.bidId || !orders?.askId) return;
+    if (!orders?.bidId && !orders?.askId) return;
 
     try {
-      const cancelResp = await this.clob.cancelOrders([orders.bidId, orders.askId]);
+      const toCancel: string[] = [];
+      if (orders.bidId) toCancel.push(orders.bidId);
+      if (orders.askId) toCancel.push(orders.askId);
+      
+      if (toCancel.length === 0) return;
+      
+      const cancelResp = await this.clob.cancelOrders(toCancel);
       
       if (cancelResp) {
         log.info({
           tokenId: tokenId.substring(0, 20) + '...',
-          canceledOrders: cancelResp.canceled || [orders.bidId, orders.askId]
+          canceledOrders: cancelResp.canceled || toCancel
         }, "🗑️ Orders canceled");
+      }
+
+      // Nettoyer le cache et les clientOrderIds
+      if (orders.bidClientOrderId) {
+        this.placedClientOrderIds.delete(orders.bidClientOrderId);
+      }
+      if (orders.askClientOrderId) {
+        this.placedClientOrderIds.delete(orders.askClientOrderId);
       }
 
       // Nettoyer le cache
