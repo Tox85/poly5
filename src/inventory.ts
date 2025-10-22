@@ -43,12 +43,22 @@ export class InventoryManager {
    */
   async saveToFile(filePath: string = INVENTORY_PERSISTENCE_FILE): Promise<void> {
     try {
-      const data: Record<string, number> = {};
-      for (const [tokenId, shares] of this.inventory.entries()) {
-        data[tokenId] = shares;
+      // Fusionner avec le contenu existant pour éviter d'écraser les autres marchés
+      let existing: Record<string, number> = {};
+      try {
+        const prev = await fs.readFile(filePath, 'utf-8');
+        existing = JSON.parse(prev) as Record<string, number>;
+      } catch (_) {
+        // Fichier absent ou illisible: on part sur un objet vide
       }
-      await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8');
-      log.debug({ filePath, count: this.inventory.size }, "📦 Inventory saved to file");
+
+      const merged: Record<string, number> = { ...existing };
+      for (const [tokenId, shares] of this.inventory.entries()) {
+        merged[tokenId] = shares;
+      }
+
+      await fs.writeFile(filePath, JSON.stringify(merged, null, 2), 'utf-8');
+      log.debug({ filePath, count: Object.keys(merged).length }, "📦 Inventory saved to file");
     } catch (error) {
       log.error({ error, filePath }, "Failed to save inventory");
     }

@@ -237,12 +237,20 @@ export class MarketMaker {
       threshold: usdcStatus.threshold
     }, "✅ USDC balance initialized");
 
-    // Synchroniser l'inventaire avec les positions réelles on-chain
+    // Charger l'inventaire persistant puis synchroniser avec les positions réelles on-chain
+    try {
+      await this.inventory.loadFromFile(INVENTORY_PERSISTENCE_FILE);
+    } catch (e) {
+      // Non bloquant si le fichier n'existe pas
+    }
+    // Synchroniser en priorité les tokens de ce marché
     log.info("📦 Synchronizing inventory from blockchain...");
     const proxyAddress = POLY_PROXY_ADDRESS;
     await this.inventory.syncFromOnChainReal(market.yesTokenId, proxyAddress);
     await this.inventory.syncFromOnChainReal(market.noTokenId, proxyAddress);
     await this.inventory.saveToFile(INVENTORY_PERSISTENCE_FILE);
+    // Mettre à jour également tous les tokens déjà connus dans le fichier (positions historiques)
+    await this.inventory.syncAllFromOnChainReal(proxyAddress);
     
     log.info({ 
       yesShares: this.inventory.getInventory(market.yesTokenId),
@@ -312,7 +320,7 @@ export class MarketMaker {
         }
       }
       
-      // Ajouter les ordres à notre tracking
+      // Ajouter les ordres à notre tracking et normaliser si off-top
       for (const [tokenId, orders] of ordersByToken.entries()) {
         const tokenSide = tokenId === this.marketInfo.yesTokenId ? 'YES' : 'NO';
         
