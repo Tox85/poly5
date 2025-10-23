@@ -358,16 +358,27 @@ async function main() {
 
 // Créer un serveur HTTP simple pour les healthchecks Railway
 const server = createServer((req, res) => {
+  rootLog.info({ url: req.url, method: req.method }, "🌐 Requête HTTP reçue");
+  
   if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
+    const healthData = { 
       status: 'healthy', 
       timestamp: new Date().toISOString(),
-      uptime: process.uptime()
-    }));
+      uptime: process.uptime(),
+      port: PORT,
+      env: {
+        NODE_ENV: process.env.NODE_ENV,
+        PORT: process.env.PORT
+      }
+    };
+    
+    rootLog.info(healthData, "✅ Healthcheck réussi");
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(healthData));
   } else {
+    rootLog.warn({ url: req.url }, "❌ Route non trouvée");
     res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not found' }));
+    res.end(JSON.stringify({ error: 'Not found', path: req.url }));
   }
 });
 
