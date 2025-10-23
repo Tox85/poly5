@@ -32,7 +32,7 @@ cp env.example .env
 - `MIN_SPREAD_CENTS=4` - Spread minimum (4¢ = rentable)
 - `MAX_SPREAD_CENTS=10` - Spread maximum
 - `TARGET_SPREAD_CENTS=4` - Spread cible
-- `TICK_IMPROVEMENT=1` - Amélioration de prix (priorité de file) ⚡
+- `TICK_IMPROVEMENT=2` - Amélioration de prix (2 ticks = plus agressif) ⚡
 - `NOTIONAL_PER_ORDER_USDC=1.5` - Montant par ordre
 - `MAX_ACTIVE_MARKETS=2` - Nombre de marchés
 
@@ -101,9 +101,10 @@ src/
 │   ├── round.ts          # Arrondis précis
 │   └── erc1155.ts        # Lecture balances ERC-1155
 │
-├── inventory.ts          # Gestion inventaire YES/NO
-├── allowanceManager.ts   # Gestion allowances USDC
-├── closeOrders.ts        # Fermeture des ordres
+├── inventory.ts              # Gestion inventaire YES/NO
+├── globalInventoryManager.ts # Gestion globale inventaire (nouveau!)
+├── allowanceManager.ts       # Gestion allowances USDC
+├── closeOrders.ts            # Fermeture des ordres
 │
 └── metrics/
     └── pnl.ts            # Tracking PnL et métriques
@@ -136,16 +137,18 @@ npm run test-websocket # Tester WebSocket
 5. **Sélection** - Top 2 marchés les plus opportuns
 6. **Init USDC** - Vérification balance/allowance
 7. **Sync Inventaire** - Lecture positions blockchain
-8. **Récupération Ordres** - Charge ordres déjà ouverts (nouveau!)
-9. **WebSocket** - Connexion feeds market + user
+8. **Gestion Inventaire Global** - Détection et placement SELL pour inventaire existant (nouveau!)
+9. **Récupération Ordres** - Charge ordres déjà ouverts
+10. **WebSocket** - Connexion feeds market + user
 
 ### En Continu
 1. **Prix Update** - Réception prix temps réel (WebSocket)
-2. **Quote Guards** - Calcul prix avec tick improvement (+1 tick)
+2. **Quote Guards** - Calcul prix avec tick improvement (+2 ticks)
 3. **Validation** - Vérification post-only (pas de cross)
 4. **Placement** - Ordres BUY/SELL avec logs forensics
-5. **Fills** - Mise à jour inventaire en temps réel
-6. **Replacement** - Si prix bouge/pas compétitif/TTL
+5. **Surveillance Inventaire Global** - Repositionnement automatique ordres SELL (nouveau!)
+6. **Fills** - Mise à jour inventaire en temps réel
+7. **Replacement** - Si prix bouge/pas compétitif/TTL
 
 ### Toutes les 60s
 - **Réconciliation ordres** - Compare cache ↔ API REST
@@ -162,10 +165,11 @@ npm run test-websocket # Tester WebSocket
 ### ✅ Market Making Intelligent
 - Placement automatique d'ordres BUY/SELL
 - **Quote Guards** : Protection post-only + amélioration de prix ⚡
-- **Tick Improvement** : Améliore le prix de 1 tick (priorité de file)
+- **Tick Improvement** : Améliore le prix de 2 ticks (plus agressif)
 - Spread dynamique adaptatif
 - Replacement automatique (prix bougé, pas compétitif, TTL)
 - Stratégie de parité YES/NO
+- **Gestion Inventaire Global** : Détection automatique et liquidation d'inventaire existant
 
 ### ✅ Réconciliation Robuste
 - **Ordres** : Sync API REST toutes les 60s (détecte ordres annulés/remplis)
@@ -256,10 +260,10 @@ npm run test-websocket # Tester WebSocket
 - **Filtrage intelligent** : Exclut marchés fermés/résolus
 
 ### Tick Improvement (Nouveau ⚡)
-- **TICK_IMPROVEMENT=1** : Améliore le prix de 1 tick (0.1¢)
-- **Priorité de file** : Vos ordres passent AVANT les autres au même prix
+- **TICK_IMPROVEMENT=2** : Améliore le prix de 2 ticks (0.2¢)
+- **Plus agressif** : Vos ordres passent AVANT les autres au même prix
 - **Plus de fills** : Meilleure position dans le carnet d'ordres
-- **Configurable** : 0=join-only, 1=recommandé, 2+=agressif
+- **Configurable** : 0=join-only, 1=standard, 2=agressif, 3+=très agressif
 
 ---
 
@@ -279,13 +283,32 @@ ISC
 
 ---
 
-**Version** : 1.0.0  
-**Dernière mise à jour** : 2025-10-12  
-**Statut** : ✅ Production-ready  
+**Version** : 1.1.0  
+**Dernière mise à jour** : 2025-10-23  
+**Statut** : ✅ Production-ready avec gestion inventaire global  
 
 ---
 
-## 🎯 Nouvelles Fonctionnalités (v1.0.0)
+## 🎯 Nouvelles Fonctionnalités (v1.1.0)
+
+### 🌍 Gestion Inventaire Global (Nouveau!)
+- **Détection automatique** : Scan de tous les tokens avec inventaire au démarrage
+- **Placement immédiat** : Ordres SELL placés automatiquement pour liquider l'inventaire
+- **Surveillance continue** : Repositionnement automatique selon les prix WebSocket
+- **Fallback REST API** : Utilise l'API REST si WebSocket indisponible
+- **Logs détaillés** : Tracking complet des ordres SELL d'inventaire
+
+### ⚡ Tick Improvement Amélioré
+- **TICK_IMPROVEMENT=2** : Configuration plus agressive (2 ticks = 0.2¢)
+- **Calculs précis** : Logs de debug pour vérifier les calculs de prix
+- **Application correcte** : Vérification que la valeur d'environnement est bien utilisée
+- **Repositionnement** : Maintien du tick improvement lors des repositionnements
+
+### 🔄 Séparation BUY/SELL Orders
+- **BUY orders** : Limités par `MAX_ACTIVE_ORDERS_PER_SIDE` (1 par défaut)
+- **SELL orders** : Illimités tant qu'il y a de l'inventaire disponible
+- **Logique séparée** : `canPlaceBuyOrder()` vs `canPlaceSellOrder()`
+- **Optimisation** : Plus d'ordres SELL pour liquider l'inventaire rapidement
 
 ### ⚡ Quote Guards & Tick Improvement
 - Protection post-only émulée (pas d'ordres marketables)

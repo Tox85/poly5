@@ -76,7 +76,8 @@ async function main() {
     MIN_SPREAD_CENTS,
     NOTIONAL_PER_ORDER_USDC, 
     MAX_MARKETS: MAX,
-    MIN_VOLUME_USDC
+    MIN_VOLUME_USDC,
+    TICK_IMPROVEMENT
   }, "🚀 Démarrage du Bot Market Maker Polymarket");
 
   // S'assurer que l'allowance USDC est suffisante

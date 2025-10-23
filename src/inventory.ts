@@ -113,6 +113,35 @@ export class InventoryManager {
         error,
         tokenId: tokenId.substring(0, 20) + '...'
       }, "❌ Failed to sync token from on-chain");
+      
+      // 🔥 FIX BUG PRIORITÉ #1: Fallback vers le fichier inventory.json si blockchain échoue
+      // Cela permet de conserver l'inventaire existant même si la lecture blockchain échoue
+      const currentInventory = this.inventory.get(tokenId) || 0;
+      if (currentInventory > 0) {
+        log.info({
+          tokenId: tokenId.substring(0, 20) + '...',
+          fallbackInventory: currentInventory.toFixed(2),
+          reason: "Using local inventory file as fallback due to blockchain sync failure"
+        }, "🔄 Using local inventory as fallback");
+      } else {
+        // Si pas d'inventaire local, essayer de charger depuis le fichier
+        try {
+          await this.loadFromFile();
+          const fileInventory = this.inventory.get(tokenId) || 0;
+          if (fileInventory > 0) {
+            log.info({
+              tokenId: tokenId.substring(0, 20) + '...',
+              fileInventory: fileInventory.toFixed(2),
+              reason: "Loaded inventory from file due to blockchain sync failure"
+            }, "📁 Loaded inventory from file");
+          }
+        } catch (fileError) {
+          log.error({
+            fileError,
+            tokenId: tokenId.substring(0, 20) + '...'
+          }, "❌ Failed to load inventory from file");
+        }
+      }
     }
   }
 

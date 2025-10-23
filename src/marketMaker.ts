@@ -47,6 +47,7 @@ import { ensurePostOnly, validateQuotePrices, checkParity } from "./lib/quote-gu
 import { InventoryManager } from "./inventory";
 import { AllowanceManager } from "./allowanceManager";
 import { OrderCloser } from "./closeOrders";
+import { GlobalInventoryManager } from "./globalInventoryManager";
 import { JsonRpcProvider } from "ethers";
 
 // Types locaux pour éviter l'import du SDK officiel
@@ -170,6 +171,7 @@ export class MarketMaker {
   private inventory: InventoryManager;
   private allowanceManager: AllowanceManager;
   private orderCloser: OrderCloser;
+  private globalInventoryManager: GlobalInventoryManager;
   private metricsInterval?: NodeJS.Timeout;
   private reconcileInterval?: NodeJS.Timeout;
   private inventorySyncInterval?: NodeJS.Timeout;
@@ -204,6 +206,7 @@ export class MarketMaker {
       config.allowanceThresholdUsdc
     );
     this.orderCloser = new OrderCloser(this.clob, this.inventory, this.provider);
+    this.globalInventoryManager = new GlobalInventoryManager(this.clob, this.inventory, this.feed, this.provider);
   }
 
   async start(market: MarketInfo) {
@@ -277,6 +280,9 @@ export class MarketMaker {
       this.handlePriceUpdate(tokenId, bestBid, bestAsk);
     });
 
+    // Initialiser la gestion globale de l'inventaire (TOUS les tokens)
+    await this.globalInventoryManager.initialize();
+    
     // Démarrer la logique de market making
     await this.initializeMarketMaking();
   }
@@ -543,16 +549,31 @@ export class MarketMaker {
             const tokenSide = tokenId === this.marketInfo.yesTokenId ? 'YES' : 'NO';
             const otherTokenId = tokenId === this.marketInfo.yesTokenId ? this.marketInfo.noTokenId : this.marketInfo.yesTokenId;
             
-            // Utiliser les prix du cache WebSocket
+            // 🔥 FIX BUG PRIORITÉ #1: Obtenir les VRAIS prix depuis le WebSocket au lieu de valeurs par défaut
+            const wsPrices = await this.getWebSocketPrices(tokenId);
+            if (!wsPrices) {
+              log.warn({
+                tokenId: tokenId.substring(0, 20) + '...',
+                reason: 'No valid WebSocket prices available'
+              }, "⚠️ Skipping replacement - no valid prices");
+              return;
+            }
+            
             const snapshot = {
-              bestBid: this.lastProcessedPrices.get(tokenId)?.bestBid || 0.5,
-              bestAsk: this.lastProcessedPrices.get(tokenId)?.bestAsk || 0.5,
+              bestBid: wsPrices.bestBid,
+              bestAsk: wsPrices.bestAsk,
               tickSize: 0.001
             };
             
-            if (snapshot.bestBid > 0 && snapshot.bestAsk > 0) {
-              await this.placeOrders(tokenId, snapshot, tokenSide);
-            }
+            log.info({
+              tokenId: tokenId.substring(0, 20) + '...',
+              tokenSide,
+              bestBid: snapshot.bestBid.toFixed(4),
+              bestAsk: snapshot.bestAsk.toFixed(4),
+              reason: 'Auto-replacement with valid WebSocket prices'
+            }, "🔄 Placing replacement orders");
+            
+            await this.placeOrders(tokenId, snapshot, tokenSide);
           } catch (error) {
             log.error({ error, tokenId: tokenId.substring(0, 20) + '...' }, "❌ Auto-replacement failed");
           }
@@ -702,6 +723,10 @@ export class MarketMaker {
     
     // Sauvegarder l'inventaire
     this.inventory.saveToFile(INVENTORY_PERSISTENCE_FILE);
+    
+    // Notifier le gestionnaire global d'inventaire du changement
+    const newShares = this.inventory.getInventory(tokenId);
+    this.globalInventoryManager.onInventoryUpdate(tokenId, newShares);
     
     // Enregistrer le trade dans le PnL
     this.pnl.recordTrade({
@@ -1710,14 +1735,18 @@ export class MarketMaker {
     const ourAskIsTopBook = currentOrders.askPrice && Math.abs(currentOrders.askPrice - bestAsk) < tickSize / 2;
     const notAtTopBook = (currentOrders.bidId && !ourBidIsTopBook) || (currentOrders.askId && !ourAskIsTopBook);
     
+    // 🔥 FIX BUG PRIORITÉ #1: Pour les ordres SELL, être plus agressif sur le remplacement
+    // Si l'ordre SELL n'est plus au top book, le remplacer immédiatement
+    const sellOrderOutOfTopBook = currentOrders.askId && !ourAskIsTopBook;
+    
     // Remplacer si le mid-price a bougé significativement
     const currentMid = (bestBid + bestAsk) / 2;
     const lastMid = currentOrders.lastMid || currentMid;
     const priceMovement = Math.abs(currentMid - lastMid) >= PRICE_CHANGE_THRESHOLD;
     
-    // Remplacer si l'ordre est trop vieux (TTL)
+    // Remplacer si l'ordre est trop vieux (TTL) - SEULEMENT pour les ordres BUY
     const orderAge = Date.now() - (currentOrders.lastPlaceTime || 0);
-    const orderTooOld = orderAge > ORDER_TTL_MS;
+    const orderTooOld = orderAge > ORDER_TTL_MS && currentOrders.bidId; // Seulement pour BUY
     
     log.info({
       ourBid: currentOrders.bidPrice?.toFixed(4) || 'none',
@@ -1727,6 +1756,7 @@ export class MarketMaker {
       ourBidIsTopBook,
       ourAskIsTopBook,
       notAtTopBook,
+      sellOrderOutOfTopBook,
       currentMid: currentMid.toFixed(4),
       lastMid: lastMid.toFixed(4),
       priceMovement,
@@ -1734,7 +1764,7 @@ export class MarketMaker {
       orderAge: (orderAge / 1000).toFixed(1) + 's',
       orderTooOld,
       ttl: (ORDER_TTL_MS / 1000).toFixed(1) + 's',
-      shouldReplace: notAtTopBook || priceMovement || orderTooOld
+      shouldReplace: notAtTopBook || priceMovement || orderTooOld || sellOrderOutOfTopBook
     }, "🔍 Replace orders check");
     
     if (priceMovement) {
@@ -1762,7 +1792,15 @@ export class MarketMaker {
       }, "🎯 Not at top book, replacing orders");
     }
     
-    return notAtTopBook || priceMovement || orderTooOld;
+    if (sellOrderOutOfTopBook) {
+      log.info({
+        ourAsk: currentOrders.askPrice?.toFixed(4) || 'N/A',
+        marketAsk: bestAsk.toFixed(4),
+        reason: "SELL order out of top book - replacing for better pricing"
+      }, "🎯 SELL order out of top book, replacing immediately");
+    }
+    
+    return notAtTopBook || priceMovement || orderTooOld || sellOrderOutOfTopBook;
   }
 
   private canReplaceOrders(): boolean {
@@ -1805,26 +1843,48 @@ export class MarketMaker {
   }
 
   /**
-   * NOUVEAU : Vérifie si on peut placer un ordre sur un side donné
-   * Respecte MAX_ACTIVE_ORDERS_PER_SIDE
+   * Vérifie si on peut placer un ordre BUY
+   * Respecte MAX_ACTIVE_ORDERS_PER_SIDE pour les BUY uniquement
    */
-  private canPlaceOrderOnSide(tokenId: string, side: 'bid' | 'ask'): boolean {
+  private canPlaceBuyOrder(tokenId: string): boolean {
     const orders = this.activeOrders.get(tokenId);
     if (!orders) return true; // Pas d'ordres existants
     
-    // Compter les ordres actifs sur ce side
-    const hasActiveOrder = side === 'bid' ? !!orders.bidId : !!orders.askId;
+    // Vérifier si on a déjà un ordre BUY actif
+    const hasActiveBuyOrder = !!orders.bidId;
     
-    if (hasActiveOrder) {
+    if (hasActiveBuyOrder) {
       log.debug({
         tokenId: tokenId.substring(0, 20) + '...',
-        side,
+        side: 'BUY',
         maxPerSide: MAX_ACTIVE_ORDERS_PER_SIDE
-      }, "🚫 Side already has active order - respecting cap");
+      }, "🚫 BUY order already exists - respecting MAX_ACTIVE_ORDERS_PER_SIDE");
       return false;
     }
     
     return true;
+  }
+
+  /**
+   * Vérifie si on peut placer un ordre SELL
+   * Les SELL sont ILLIMITÉS car ils vendent l'inventaire existant
+   */
+  private canPlaceSellOrder(tokenId: string): boolean {
+    // Les ordres SELL ne sont PAS limités par MAX_ACTIVE_ORDERS
+    // car ils vendent l'inventaire existant (pas de risque financier)
+    return true;
+  }
+
+  /**
+   * NOUVEAU : Vérifie si on peut placer un ordre sur un side donné
+   * Respecte MAX_ACTIVE_ORDERS_PER_SIDE
+   */
+  private canPlaceOrderOnSide(tokenId: string, side: 'bid' | 'ask'): boolean {
+    if (side === 'bid') {
+      return this.canPlaceBuyOrder(tokenId);
+    } else {
+      return this.canPlaceSellOrder(tokenId);
+    }
   }
 
   /**
@@ -2014,35 +2074,26 @@ export class MarketMaker {
         hasInventory: currentInventory > 0
       }, "📦 Current inventory status");
 
-      // AMÉLIORATION #4: TICK IMPROVEMENT AGRESSIF
+      // 🔥 FIX BUG PRIORITÉ #1: Le tick improvement est DÉJÀ appliqué dans ensurePostOnly()
+      // Ne pas l'appliquer une deuxième fois ici pour éviter la double application
       const tickSize = snapshot.tickSize || 0.001;
-      const tickImprovement = tickSize; // 1 tick au lieu de 0.5
-      
-      // Prix avec tick improvement agressif
-      const improvedBidPrice = Math.max(snapshot.bestBid + tickImprovement, bidPrice);
-      const improvedAskPrice = Math.min(snapshot.bestAsk - tickImprovement, askPrice);
       
       log.info({
         tokenId: tokenId.substring(0, 20) + '...',
         tokenSide,
-        originalBid: bidPrice.toFixed(4),
-        improvedBid: improvedBidPrice.toFixed(4),
-        originalAsk: askPrice.toFixed(4),
-        improvedAsk: improvedAskPrice.toFixed(4),
+        bidPrice: bidPrice.toFixed(4),
+        askPrice: askPrice.toFixed(4),
         tickSize: tickSize.toFixed(4),
-        tickImprovement: tickImprovement.toFixed(4)
-      }, "🎯 Tick improvement applied");
-      
-      // Utiliser les prix améliorés
-      bidPrice = improvedBidPrice;
-      askPrice = improvedAskPrice;
+        note: "Tick improvement already applied in ensurePostOnly()"
+      }, "🎯 Using prices from ensurePostOnly (tick improvement already applied)");
       
       // Calculer les tailles séparément pour BUY et SELL
       const buySize = this.calculateOrderSize(bidPrice);
       
-      // 🔥 FIX BUG PRIORITÉ #1: SELL plus agressif si inventaire disponible
-      // Si on a de l'inventaire, on vend TOUT ce qu'on peut (dans les limites)
-      const sellSize = currentInventory > 0 ? 
+      // 🔥 FIX BUG PRIORITÉ #1: SELL avec seuil minimum d'inventaire
+      // Seuil minimum pour éviter de vendre des quantités insignifiantes
+      const MIN_INVENTORY_FOR_SELL = 0.1; // Minimum 0.1 shares pour placer un ordre SELL
+      const sellSize = currentInventory >= MIN_INVENTORY_FOR_SELL ? 
         Math.min(currentInventory, MAX_SELL_PER_ORDER_SHARES) : // Vendre jusqu'à la limite max
         null;
 
@@ -2078,8 +2129,9 @@ export class MarketMaker {
         tokenSide,
         currentInventory: currentInventory.toFixed(2),
         sellSize: sellSize?.toFixed(2) || 'null',
+        minInventoryForSell: MIN_INVENTORY_FOR_SELL,
         canSell,
-        reason: canSell ? 'Can sell (has inventory)' : 'Cannot sell (no inventory)'
+        reason: canSell ? `Can sell (inventory >= ${MIN_INVENTORY_FOR_SELL})` : `Cannot sell (inventory < ${MIN_INVENTORY_FOR_SELL})`
       }, "🔍 SELL solvency check");
 
       // LOGIQUE DE MARKET MAKING : Placer BUY et SELL simultanément
@@ -2088,17 +2140,14 @@ export class MarketMaker {
       
       // AMÉLIORATION #1: SELL CONTINU - Toujours vendre si inventaire disponible
       // ✅ FIX: Assigner aux variables déclarées au niveau de la fonction
-      // 🔧 CORRECTION CRITIQUE: Respecter MAX_ACTIVE_ORDERS_PER_SIDE
-      const canPlaceBuyOrder = this.canPlaceOrderOnSide(tokenId, 'bid');
-      const canPlaceSellOrder = this.canPlaceOrderOnSide(tokenId, 'ask');
-      
       // 🔥 FIX BUG PRIORITÉ #1: Logique séparée BUY/SELL
-      // BUY: Respecter les limites de capital et de parité
-      shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false) && canPlaceBuyOrder;
+      // BUY: Respecter les limites de capital, de parité ET MAX_ACTIVE_ORDERS
+      shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false) && this.canPlaceBuyOrder(tokenId);
       
-      // SELL: PRIORITÉ ABSOLUE si inventaire disponible (pas de limite de capital)
+      // SELL: PRIORITÉ ABSOLUE si inventaire disponible (PAS de limite MAX_ACTIVE_ORDERS)
       // On vend ce qu'on possède déjà, donc pas de risque financier
-      shouldPlaceSell = canSell && currentInventory > 0 && canPlaceSellOrder && (options?.placeSell !== false);
+      // Les SELL ne dépendent PAS de MAX_ACTIVE_ORDERS car ils vendent l'inventaire existant
+      shouldPlaceSell = canSell && currentInventory > 0 && (options?.placeSell !== false) && this.canPlaceSellOrder(tokenId);
       
       // DEBUG : Vérifier chaque condition individuellement
       log.debug({
@@ -2107,11 +2156,14 @@ export class MarketMaker {
         canBuy,
         parityBiasNotSELL: parityBias !== 'SELL',
         optionsPlaceBuyNotFalse: options?.placeBuy !== false,
+        canPlaceBuyOrder: this.canPlaceBuyOrder(tokenId),
         shouldPlaceBuy,
         canSell,
-        parityBiasNotBUY: parityBias !== 'BUY',
+        currentInventory: currentInventory.toFixed(2),
+        minInventoryForSell: MIN_INVENTORY_FOR_SELL,
         optionsPlaceSellNotFalse: options?.placeSell !== false,
-        shouldPlaceSell
+        shouldPlaceSell,
+        note: "SELL ne dépend plus de MAX_ACTIVE_ORDERS"
       }, "🔍 DEBUG: Order placement conditions breakdown");
       
       // Si on a de l'inventaire, on peut toujours vendre (logique conservée)
@@ -2398,14 +2450,39 @@ export class MarketMaker {
             // ✅ FIX DOUBLE PLACEMENT: Vérifier si on a déjà un ordre SELL actif AVANT de créer un nouveau
             const existingOrders = this.activeOrders.get(tokenId);
             if (existingOrders?.askId) {
-              log.info({
-                existingOrderId: existingOrders.askId.substring(0, 16) + '...',
-                existingPrice: existingOrders.askPrice?.toFixed(4),
-                newPrice: askPrice.toFixed(4),
-                tokenId: tokenId.substring(0, 20) + '...',
-                side: "SELL"
-              }, "⚠️ SELL order already exists - skipping duplicate placement");
-              shouldPlaceSell = false;
+              // Vérifier si l'ordre existe vraiment via l'API
+              try {
+                const apiOrders = await this.clob.getOrders({ tokenId });
+                const activeSellOrder = apiOrders.find((order: any) => 
+                  order.orderID === existingOrders.askId && 
+                  order.status === 'OPEN'
+                );
+                
+                if (activeSellOrder) {
+                  log.info({
+                    existingOrderId: existingOrders.askId.substring(0, 16) + '...',
+                    existingPrice: existingOrders.askPrice?.toFixed(4),
+                    newPrice: askPrice.toFixed(4),
+                    tokenId: tokenId.substring(0, 20) + '...',
+                    side: "SELL"
+                  }, "⚠️ SELL order already exists - skipping duplicate placement");
+                  shouldPlaceSell = false;
+                } else {
+                  // L'ordre n'existe plus, nettoyer la référence locale
+                  log.info({
+                    orderId: existingOrders.askId.substring(0, 16) + '...',
+                    tokenId: tokenId.substring(0, 20) + '...'
+                  }, "🧹 Cleaning up stale SELL order reference");
+                  existingOrders.askId = undefined;
+                  existingOrders.askPrice = undefined;
+                }
+              } catch (error) {
+                log.warn({
+                  tokenId: tokenId.substring(0, 20) + '...',
+                  error: error instanceof Error ? error.message : 'Unknown error'
+                }, "⚠️ Could not verify SELL order status, assuming it exists");
+                shouldPlaceSell = false;
+              }
             }
             
             const maker = this.clob.getMakerAddress();
@@ -2649,7 +2726,7 @@ export class MarketMaker {
       
       try {
         // Obtenir l'adresse du propriétaire depuis l'allowance manager
-        const ownerAddress = process.env.CLOB_API_KEY || '';
+        const ownerAddress = process.env.POLY_PROXY_ADDRESS || '';
         await this.inventory.syncFromOnChainReal(tokenId, ownerAddress);
         this.lastInventorySync.set(tokenId, now);
         
@@ -3129,12 +3206,13 @@ export class MarketMaker {
     if (orderAge > ORDER_TTL_MS) {
       const toCancel: string[] = [];
       
+      // 🔥 FIX BUG PRIORITÉ #1: Ne pas annuler les ordres SELL (askId) - ils doivent rester actifs
+      // Les ordres SELL vendent l'inventaire existant et doivent rester jusqu'à être remplis
       if (orders.bidId) {
         toCancel.push(orders.bidId);
       }
-      if (orders.askId) {
-        toCancel.push(orders.askId);
-      }
+      // ❌ SUPPRIMÉ: if (orders.askId) { toCancel.push(orders.askId); }
+      // Les ordres SELL ne sont JAMAIS annulés par le TTL
       
       if (toCancel.length > 0) {
         try {
@@ -3147,15 +3225,28 @@ export class MarketMaker {
           
           await this.clob.cancelOrders(toCancel);
           
-          // Nettoyer le cache et les clientOrderIds
+          // Nettoyer le cache et les clientOrderIds SEULEMENT pour les ordres BUY annulés
           if (orders.bidClientOrderId) {
             this.placedClientOrderIds.delete(orders.bidClientOrderId);
           }
-          if (orders.askClientOrderId) {
-            this.placedClientOrderIds.delete(orders.askClientOrderId);
-          }
+          // ❌ SUPPRIMÉ: Les ordres SELL ne sont pas nettoyés car ils restent actifs
           
-          this.activeOrders.delete(tokenId);
+          // 🔥 FIX BUG PRIORITÉ #1: Ne supprimer que les ordres BUY du cache
+          // Garder les ordres SELL dans activeOrders car ils restent actifs
+          if (orders.askId) {
+            // Garder l'ordre SELL dans le cache, supprimer seulement le BUY
+            this.activeOrders.set(tokenId, {
+              ...orders,
+              bidId: undefined,
+              bidPrice: undefined,
+              bidSize: undefined,
+              bidClientOrderId: undefined,
+              lastPlaceTime: orders.lastPlaceTime
+            });
+          } else {
+            // Si pas d'ordre SELL, supprimer complètement
+            this.activeOrders.delete(tokenId);
+          }
           
           log.info({
             tokenId: tokenId.substring(0, 20) + '...',
