@@ -54,6 +54,7 @@ type OrderType = "GTC" | "IOC" | "FOK";
 type Side = "BUY" | "SELL";
 
 const log = rootLog.child({ name: "mm" });
+const ORDERS_IN_DOUBT_FORCE_QUOTE_MS = 5_000;
 
 // Helper pour convertir en unités Polymarket (6 décimales)
 const toUnits = (x: number) => BigInt(Math.round(x * 1e6));
@@ -167,6 +168,16 @@ export class MarketMaker {
   private marketHealthCheckInterval?: NodeJS.Timeout;
   private cleanupInterval?: NodeJS.Timeout; // ✅ FIX #7: Interval pour cleanup clientOrderIds
   private apiOrdersZeroRechecks = new Map<string, number>(); // NOUVEAU : Compteur de rechecks pour API=0
+  private ordersInDoubt = new Map<string, {
+    originalOrders: {
+      bidId?: string;
+      askId?: string;
+      bidClientOrderId?: string;
+      askClientOrderId?: string;
+    };
+    startTime: number;
+    forceQuoteTriggered: boolean;
+  }>();
   
   // Flag d'état pour la rotation
   public stopped = false;
@@ -491,6 +502,7 @@ export class MarketMaker {
     this.metricsInterval = setInterval(() => {
       this.pnl.logMetrics();
       this.logCapitalAtRisk();
+      this.logOrdersInDoubtMetrics();
     }, METRICS_LOG_INTERVAL_MS);
     
     // Réconciliation toutes les 60s
@@ -950,7 +962,7 @@ export class MarketMaker {
   private logCapitalAtRisk() {
     const totalNotionalAtRisk = this.getNotionalAtRisk();
     const usdcSummary = this.allowanceManager.getSummary();
-    
+
     log.info({
       notionalAtRisk: totalNotionalAtRisk.toFixed(2),
       maxAllowed: MAX_NOTIONAL_AT_RISK_USDC,
@@ -958,6 +970,66 @@ export class MarketMaker {
       usdcBalance: usdcSummary.usdcBalance,
       activeOrders: this.activeOrders.size
     }, "💼 Capital at risk");
+  }
+
+  private logOrdersInDoubtMetrics() {
+    if (this.ordersInDoubt.size === 0) {
+      return;
+    }
+
+    const now = Date.now();
+
+    for (const [tokenId, state] of this.ordersInDoubt) {
+      const durationMs = now - state.startTime;
+
+      log.warn({
+        tokenId: tokenId.substring(0, 20) + '...',
+        durationMs,
+        durationSeconds: (durationMs / 1000).toFixed(3),
+        metric: "orders_in_doubt_duration"
+      }, "⏱️ Tracking orders_in_doubt_duration");
+
+      if (!state.forceQuoteTriggered && durationMs >= ORDERS_IN_DOUBT_FORCE_QUOTE_MS) {
+        state.forceQuoteTriggered = true;
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          durationMs,
+          thresholdMs: ORDERS_IN_DOUBT_FORCE_QUOTE_MS
+        }, "🚨 Force quoting after prolonged doubt");
+
+        this.forceRequote(tokenId)
+          .then(success => {
+            if (!success) {
+              state.forceQuoteTriggered = false;
+            }
+          })
+          .catch(error => {
+            state.forceQuoteTriggered = false;
+            log.error({
+              tokenId: tokenId.substring(0, 20) + '...',
+              error
+            }, "❌ Failed to force requote for token in doubt");
+          });
+      }
+    }
+  }
+
+  private resolveOrdersInDoubt(tokenId: string, resolution: string) {
+    const state = this.ordersInDoubt.get(tokenId);
+    if (!state) {
+      return;
+    }
+
+    const durationMs = Date.now() - state.startTime;
+    log.info({
+      tokenId: tokenId.substring(0, 20) + '...',
+      durationMs,
+      durationSeconds: (durationMs / 1000).toFixed(3),
+      resolution,
+      metric: "orders_in_doubt_duration"
+    }, "✅ Orders in doubt resolved");
+
+    this.ordersInDoubt.delete(tokenId);
   }
 
   /**
@@ -1119,104 +1191,81 @@ export class MarketMaker {
    */
   private async handleApiOrdersZero() {
     const tokens = [this.marketInfo!.yesTokenId, this.marketInfo!.noTokenId];
-    
+
     for (const tokenId of tokens) {
       const localOrders = this.activeOrders.get(tokenId);
       if (!localOrders) continue;
-      
+
       const recheckKey = tokenId;
       const currentRechecks = this.apiOrdersZeroRechecks.get(recheckKey) || 0;
-      
-      if (currentRechecks === 0) {
-        // Premier check : marquer comme inDoubt et programmer des rechecks
-        log.warn({
-          tokenId: tokenId.substring(0, 20) + '...',
-          localOrders: this.activeOrders.size,
-          apiOrders: 0,
-          recheck: 1
-        }, "⚠️ API says 0 orders but we have local orders - marking in doubt, will recheck");
-        
-        this.apiOrdersZeroRechecks.set(recheckKey, 1);
-        
-        // Programmer un recheck dans 10 secondes
-        setTimeout(() => this.recheckApiOrders(tokenId), 10000);
-        
-      } else if (currentRechecks < 3) {
-        // Recheck 2 et 3 : vérifier à nouveau l'API
-        log.info({
-          tokenId: tokenId.substring(0, 20) + '...',
-          recheck: currentRechecks + 1
-        }, "🔄 Rechecking API for orders...");
-        
-        this.apiOrdersZeroRechecks.set(recheckKey, currentRechecks + 1);
-        
-        // Vérifier à nouveau l'API
-        const openOrders = await this.orderCloser.getOpenOrders();
-        const relevantOrders = openOrders?.filter((order: any) => 
-          order.asset_id === tokenId
-        ) || [];
-        
-        if (relevantOrders.length > 0) {
-          // L'API a retrouvé les ordres !
-          log.info({
-            tokenId: tokenId.substring(0, 20) + '...',
-            foundOrders: relevantOrders.length
-          }, "✅ API recheck found orders - resolving in doubt");
-          
-          this.apiOrdersZeroRechecks.delete(recheckKey);
-          return; // Pas besoin de cancel
-        }
-        
-        // Programmer le prochain recheck SEULEMENT si on n'a pas déjà fait 3 rechecks
-        if (currentRechecks + 1 < 3) {
-          setTimeout(() => this.recheckApiOrders(tokenId), 10000);
-        }
-        
-      } else if (currentRechecks === 3) {
-        // Après 3 rechecks, l'API dit toujours 0 → cancel explicite UNE SEULE FOIS
-        log.warn({
-          tokenId: tokenId.substring(0, 20) + '...',
-          rechecks: currentRechecks
-        }, "⚠️ API consistently says 0 orders after 3 rechecks - sending explicit cancel");
-        
-        // Marquer comme traité pour ne pas réessayer
-        this.apiOrdersZeroRechecks.set(recheckKey, 4); // 4 = déjà envoyé le cancel
-        
-        const toCancel: string[] = [];
-        if (localOrders.bidId) toCancel.push(localOrders.bidId);
-        if (localOrders.askId) toCancel.push(localOrders.askId);
-        
-        if (toCancel.length > 0) {
-          try {
-            await this.clob.cancelOrders(toCancel);
-            log.info({
-              tokenId: tokenId.substring(0, 20) + '...',
-              canceledOrders: toCancel
-            }, "✅ Sent explicit cancel for in-doubt orders");
-            
-            // Attendre 2 secondes puis nettoyer le cache
-            setTimeout(() => {
-              this.activeOrders.delete(tokenId);
-              this.apiOrdersZeroRechecks.delete(recheckKey);
-              log.info({
-                tokenId: tokenId.substring(0, 20) + '...'
-              }, "🧹 Cleaned up cache after explicit cancel");
-            }, 2000);
-            
-          } catch (error) {
-            log.error({
-              tokenId: tokenId.substring(0, 20) + '...',
-              error
-            }, "❌ Failed to send explicit cancel");
-            // Retirer du compteur en cas d'erreur pour pouvoir réessayer
-            this.apiOrdersZeroRechecks.delete(recheckKey);
-          }
-        } else {
-          // Pas d'ordres à cancel, juste nettoyer
-          this.activeOrders.delete(tokenId);
-          this.apiOrdersZeroRechecks.delete(recheckKey);
-        }
+
+      if (currentRechecks > 0) {
+        // Déjà marqué comme suspect, attendre le recheck en cours
+        continue;
       }
+
+      log.warn({
+        tokenId: tokenId.substring(0, 20) + '...',
+        localOrders: this.activeOrders.size,
+        apiOrders: 0,
+        recheck: 1
+      }, "⚠️ API says 0 orders but we have local orders - marking in doubt and clearing cache");
+
+      const suspiciousOrders = {
+        bidId: localOrders.bidId,
+        askId: localOrders.askId,
+        bidClientOrderId: localOrders.bidClientOrderId,
+        askClientOrderId: localOrders.askClientOrderId
+      };
+
+      // Nettoyer immédiatement le cache local pour éviter de supposer que les ordres existent toujours
+      const cleanedOrders = { ...localOrders } as any;
+      delete cleanedOrders.bidId;
+      delete cleanedOrders.askId;
+      delete cleanedOrders.bidPrice;
+      delete cleanedOrders.askPrice;
+      delete cleanedOrders.bidSize;
+      delete cleanedOrders.askSize;
+      delete cleanedOrders.bidClientOrderId;
+      delete cleanedOrders.askClientOrderId;
+
+      if (Object.keys(cleanedOrders).length === 0) {
+        this.activeOrders.delete(tokenId);
+      } else {
+        this.activeOrders.set(tokenId, cleanedOrders);
+      }
+
+      if (suspiciousOrders.bidId) {
+        this.liveClientOrderIds.delete(suspiciousOrders.bidId);
+        this.userFeed?.removeLocalOrderId(suspiciousOrders.bidId);
+      }
+      if (suspiciousOrders.askId) {
+        this.liveClientOrderIds.delete(suspiciousOrders.askId);
+        this.userFeed?.removeLocalOrderId(suspiciousOrders.askId);
+      }
+      if (suspiciousOrders.bidClientOrderId) {
+        this.placedClientOrderIds.delete(suspiciousOrders.bidClientOrderId);
+      }
+      if (suspiciousOrders.askClientOrderId) {
+        this.placedClientOrderIds.delete(suspiciousOrders.askClientOrderId);
+      }
+
+      this.ordersInDoubt.set(tokenId, {
+        originalOrders: suspiciousOrders,
+        startTime: Date.now(),
+        forceQuoteTriggered: false
+      });
+
+      this.apiOrdersZeroRechecks.set(recheckKey, 1);
+
+      setTimeout(() => {
+        this.recheckApiOrders(tokenId).catch(error => {
+          log.error({
+            tokenId: tokenId.substring(0, 20) + '...',
+            error
+          }, "❌ Failed to run API zero recheck");
+        });
+      }, 2000);
     }
   }
 
@@ -1225,29 +1274,142 @@ export class MarketMaker {
    */
   private async recheckApiOrders(tokenId: string) {
     if (!this.marketInfo || this.stopped) return;
-    
+
     const recheckKey = tokenId;
     const currentRechecks = this.apiOrdersZeroRechecks.get(recheckKey) || 0;
-    
-    // Ne pas recheck si on a déjà fait 3 tentatives
-    if (currentRechecks >= 3) {
+    if (currentRechecks === 0) {
       return;
     }
-    
+
     const openOrders = await this.orderCloser.getOpenOrders();
-    const relevantOrders = openOrders?.filter((order: any) => 
+    const relevantOrders = openOrders?.filter((order: any) =>
       order.asset_id === tokenId
     ) || [];
-    
+
     if (relevantOrders.length > 0) {
       log.info({
         tokenId: tokenId.substring(0, 20) + '...',
         foundOrders: relevantOrders.length
-      }, "✅ Recheck found orders - resolving in doubt");
-      
+      }, "✅ Recheck found orders - rebuilding local state");
+
+      this.syncActiveOrdersFromApi(tokenId, relevantOrders);
       this.apiOrdersZeroRechecks.delete(tokenId);
+      this.resolveOrdersInDoubt(tokenId, "api_found_orders");
+      return;
     }
-    // Ne plus appeler handleApiOrdersZero ici pour éviter la boucle infinie
+
+    log.warn({
+      tokenId: tokenId.substring(0, 20) + '...',
+      recheck: currentRechecks + 1
+    }, "⚠️ Recheck confirms zero orders - issuing explicit cancel and force requote");
+
+    await this.handleMissingOrdersAfterRecheck(tokenId);
+  }
+
+  private syncActiveOrdersFromApi(tokenId: string, orders: any[]) {
+    const existing = this.activeOrders.get(tokenId) || {};
+    const updated: any = { ...existing };
+
+    const bidOrder = orders.find((order: any) => order.side === "BUY");
+    if (bidOrder) {
+      updated.bidId = bidOrder.id;
+      updated.bidPrice = parseFloat(bidOrder.price || bidOrder.limit_price || "0");
+      const bidSizeRaw = bidOrder.original_size ?? bidOrder.size ?? bidOrder.remaining_size ?? "0";
+      updated.bidSize = parseFloat(bidSizeRaw);
+      this.userFeed?.addLocalOrderId(bidOrder.id);
+      this.liveClientOrderIds.add(bidOrder.id);
+    }
+
+    const askOrder = orders.find((order: any) => order.side === "SELL");
+    if (askOrder) {
+      updated.askId = askOrder.id;
+      updated.askPrice = parseFloat(askOrder.price || askOrder.limit_price || "0");
+      const askSizeRaw = askOrder.original_size ?? askOrder.size ?? askOrder.remaining_size ?? "0";
+      updated.askSize = parseFloat(askSizeRaw);
+      this.userFeed?.addLocalOrderId(askOrder.id);
+      this.liveClientOrderIds.add(askOrder.id);
+    }
+
+    this.activeOrders.set(tokenId, updated);
+  }
+
+  private async handleMissingOrdersAfterRecheck(tokenId: string) {
+    const recheckKey = tokenId;
+    const inDoubt = this.ordersInDoubt.get(tokenId);
+    const toCancel: string[] = [];
+
+    if (inDoubt?.originalOrders.bidId) {
+      toCancel.push(inDoubt.originalOrders.bidId);
+    }
+    if (inDoubt?.originalOrders.askId) {
+      toCancel.push(inDoubt.originalOrders.askId);
+    }
+
+    if (toCancel.length > 0) {
+      try {
+        await this.clob.cancelOrders(toCancel);
+        log.info({
+          tokenId: tokenId.substring(0, 20) + '...',
+          canceledOrders: toCancel
+        }, "✅ Sent explicit cancel after recheck confirmation");
+      } catch (error) {
+        log.error({
+          tokenId: tokenId.substring(0, 20) + '...',
+          error,
+          canceledOrders: toCancel
+        }, "❌ Failed to cancel suspected orders after recheck");
+      }
+    } else {
+      log.info({
+        tokenId: tokenId.substring(0, 20) + '...'
+      }, "ℹ️ No explicit cancel required after recheck");
+    }
+
+    this.apiOrdersZeroRechecks.delete(recheckKey);
+
+    try {
+      const requotePlaced = await this.forceRequote(tokenId);
+      if (requotePlaced) {
+        this.resolveOrdersInDoubt(tokenId, toCancel.length > 0 ? "cancelled_and_requoted" : "requoted_without_cancel");
+      } else {
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...'
+        }, "⚠️ Force requote skipped due to missing market data");
+      }
+    } catch (error) {
+      log.error({
+        tokenId: tokenId.substring(0, 20) + '...',
+        error
+      }, "❌ Failed to force requote after recheck");
+    }
+  }
+
+  private async forceRequote(tokenId: string): Promise<boolean> {
+    if (!this.marketInfo || this.stopped) {
+      return false;
+    }
+
+    const lastPrices = this.feed.getLastPrices(tokenId);
+    if (!lastPrices || lastPrices.bestBid === null || lastPrices.bestAsk === null) {
+      log.warn({
+        tokenId: tokenId.substring(0, 20) + '...',
+        prices: lastPrices
+      }, "⚠️ Cannot force requote - missing market prices");
+      return false;
+    }
+
+    const tokenSide = tokenId === this.marketInfo.yesTokenId ? "YES" : "NO";
+    const snapshot = { bestBid: lastPrices.bestBid, bestAsk: lastPrices.bestAsk, tickSize: 0.001 };
+
+    log.info({
+      tokenId: tokenId.substring(0, 20) + '...',
+      tokenSide,
+      bestBid: lastPrices.bestBid,
+      bestAsk: lastPrices.bestAsk
+    }, "🚀 Forcing quote refresh for token in doubt");
+
+    await this.placeOrders(tokenId, snapshot, tokenSide);
+    return true;
   }
 
   /**
