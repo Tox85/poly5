@@ -2,6 +2,7 @@
 import "dotenv/config";
 import pino from "pino";
 import { LOG_LEVEL } from "./config";
+import { createServer } from "http";
 
 // Validation stricte avec Zod (optionnelle, activée via USE_ZOD_VALIDATION=true)
 // Sera appelée dans main() pour éviter top-level await
@@ -354,5 +355,26 @@ async function main() {
     process.exit(0);
   });
 }
+
+// Créer un serveur HTTP simple pour les healthchecks Railway
+const server = createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ 
+      status: 'healthy', 
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime()
+    }));
+  } else {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
+  }
+});
+
+// Démarrer le serveur sur le port Railway ou 3000 par défaut
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  rootLog.info({ port: PORT }, "🌐 Serveur HTTP démarré pour healthchecks");
+});
 
 main().catch(e=>{ log.error(e); process.exit(1); });
