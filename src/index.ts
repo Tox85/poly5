@@ -347,12 +347,23 @@ async function main() {
   process.on('SIGTERM', async () => {
     log.info("🛑 SIGTERM reçu (Railway/Docker shutdown), arrêt gracieux en cours...");
     
-    for (const mm of marketMakers) {
-      await mm.stop();
+    try {
+      // Arrêter tous les market makers
+      for (const mm of marketMakers) {
+        await mm.stop();
+      }
+      
+      // Fermer le serveur HTTP
+      server.close(() => {
+        log.info("🌐 Serveur HTTP fermé");
+      });
+      
+      log.info("👋 Bot arrêté proprement (graceful shutdown)");
+      process.exit(0);
+    } catch (error) {
+      log.error({ error }, "❌ Erreur lors de l'arrêt gracieux");
+      process.exit(1);
     }
-    
-    log.info("👋 Bot arrêté proprement (graceful shutdown)");
-    process.exit(0);
   });
 }
 
@@ -388,4 +399,18 @@ server.listen(PORT, () => {
   rootLog.info({ port: PORT }, "🌐 Serveur HTTP démarré pour healthchecks");
 });
 
-main().catch(e=>{ log.error(e); process.exit(1); });
+// Gestion des erreurs non capturées
+process.on('uncaughtException', (error) => {
+  rootLog.error({ error }, "❌ Erreur non capturée");
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  rootLog.error({ reason, promise }, "❌ Promesse rejetée non gérée");
+  process.exit(1);
+});
+
+main().catch(e=>{ 
+  rootLog.error({ error: e }, "❌ Erreur dans main()"); 
+  process.exit(1); 
+});
