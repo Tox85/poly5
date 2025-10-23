@@ -21,9 +21,9 @@ export const NOTIONAL_PER_ORDER_USDC = Number(process.env.NOTIONAL_PER_ORDER_USD
 export const MAX_ACTIVE_ORDERS = Number(process.env.MAX_ACTIVE_ORDERS) || 100;
 export const MAX_ACTIVE_ORDERS_PER_SIDE = Number(process.env.MAX_ACTIVE_ORDERS_PER_SIDE) || 1;
 // ✅ FIX PRICE TRACKING: Réduire le cooldown pour réagir plus vite aux mouvements de prix
-export const REPLACE_COOLDOWN_MS = Number(process.env.REPLACE_COOLDOWN_MS) || 2000; // 2s au lieu de 1.5s pour plus de stabilité
-export const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS) || 240000; // 240s (4 minutes) pour éviter les ordres fantômes
-export const PRICE_CHANGE_THRESHOLD = Number(process.env.PRICE_CHANGE_THRESHOLD) || 0.002; // 0.2¢ seuil de mouvement significatif
+export const REPLACE_COOLDOWN_MS = Number(process.env.REPLACE_COOLDOWN_MS) || 500; // 500ms pour réactivité maximale (4x plus rapide)
+export const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS) || 45000; // 45s pour éviter fills à prix obsolètes (5x plus court)
+export const PRICE_CHANGE_THRESHOLD = Number(process.env.PRICE_CHANGE_THRESHOLD) || 0.001; // 0.1¢ = 1 tick pour détecter chaque mouvement
 export const PROXY_ADDRESS = process.env.POLY_PROXY_ADDRESS!;
 export const DRY_RUN = process.env.DRY_RUN === "true";
 

@@ -156,6 +156,10 @@ export class MarketMaker {
   private marketInfo: MarketInfo | null = null;
   private lastPlaceTime = 0; // Anti-spam pour les logs
   private provider: JsonRpcProvider;
+  // 🔒 CORRECTION FINALE: VERROU PAR TOKENID - Empêcher les placements simultanés sur le même token
+  private placementInProgressByToken = new Map<string, boolean>();
+  // 🔄 AMÉLIORATION #3: RECHARGEMENT PÉRIODIQUE DE L'INVENTAIRE
+  private lastInventorySync = new Map<string, number>();
   // ✅ FIX #4: Cache des derniers prix traités pour éviter le spam
   private lastProcessedPrices = new Map<string, {bestBid: number, bestAsk: number}>();
   
@@ -518,12 +522,51 @@ export class MarketMaker {
       this.cleanupClientOrderIds();
     }, 300_000); // 5 minutes
     
+    // 🔧 CORRECTION CRITIQUE: Tâche périodique pour replacement automatique
+    setInterval(async () => {
+      if (!this.marketInfo) return;
+      
+      // Vérifier tous les tokens pour replacement automatique
+      const tokenIds = [this.marketInfo.yesTokenId, this.marketInfo.noTokenId];
+      
+      for (const tokenId of tokenIds) {
+        const orders = this.activeOrders.get(tokenId);
+        if (!orders || (!orders.bidId && !orders.askId)) {
+          // Pas d'ordres actifs, essayer de placer de nouveaux ordres
+          log.info({
+            tokenId: tokenId.substring(0, 20) + '...',
+            reason: 'No active orders - attempting replacement'
+          }, "🔄 Auto-replacement triggered");
+          
+          try {
+            // Obtenir les prix actuels via WebSocket cache et déclencher le placement
+            const tokenSide = tokenId === this.marketInfo.yesTokenId ? 'YES' : 'NO';
+            const otherTokenId = tokenId === this.marketInfo.yesTokenId ? this.marketInfo.noTokenId : this.marketInfo.yesTokenId;
+            
+            // Utiliser les prix du cache WebSocket
+            const snapshot = {
+              bestBid: this.lastProcessedPrices.get(tokenId)?.bestBid || 0.5,
+              bestAsk: this.lastProcessedPrices.get(tokenId)?.bestAsk || 0.5,
+              tickSize: 0.001
+            };
+            
+            if (snapshot.bestBid > 0 && snapshot.bestAsk > 0) {
+              await this.placeOrders(tokenId, snapshot, tokenSide);
+            }
+          } catch (error) {
+            log.error({ error, tokenId: tokenId.substring(0, 20) + '...' }, "❌ Auto-replacement failed");
+          }
+        }
+      }
+    }, 10000); // Vérifier toutes les 10 secondes
+
     log.info({ 
       metricsInterval: METRICS_LOG_INTERVAL_MS, 
       reconcileInterval: RECONCILE_INTERVAL_MS,
       inventorySyncInterval: 120_000,
       marketHealthCheckInterval: 180_000,
-      cleanupInterval: 300_000
+      cleanupInterval: 300_000,
+      autoReplacementInterval: 10000
     }, "⏱️ Periodic tasks started");
   }
   
@@ -966,6 +1009,161 @@ export class MarketMaker {
   }
 
   /**
+   * 💰 FIX BUG #2 + #3: Détecte les fills par polling API et synchronise l'inventaire
+   * Cette méthode est appelée toutes les 60s comme backup si le WebSocket user ne fonctionne pas
+   * C'est la méthode LA PLUS FIABLE pour détecter les fills
+   */
+  private async detectFillsByPolling() {
+    if (!this.marketInfo) return;
+    
+    try {
+      // Récupérer l'inventaire actuel depuis la blockchain
+      const proxyAddress = POLY_PROXY_ADDRESS;
+      const yesTokenId = this.marketInfo.yesTokenId;
+      const noTokenId = this.marketInfo.noTokenId;
+      
+      // Inventaire AVANT la synchronisation
+      const oldYesShares = this.inventory.getInventory(yesTokenId);
+      const oldNoShares = this.inventory.getInventory(noTokenId);
+      
+      // Synchroniser depuis la blockchain (source de vérité absolue)
+      await this.inventory.syncFromOnChainReal(yesTokenId, proxyAddress);
+      await this.inventory.syncFromOnChainReal(noTokenId, proxyAddress);
+      await this.inventory.saveToFile(INVENTORY_PERSISTENCE_FILE);
+      
+      // Inventaire APRÈS la synchronisation
+      const newYesShares = this.inventory.getInventory(yesTokenId);
+      const newNoShares = this.inventory.getInventory(noTokenId);
+      
+      // Détecter les changements = FILLS !
+      const yesDelta = newYesShares - oldYesShares;
+      const noDelta = newNoShares - oldNoShares;
+      
+      // Si l'inventaire a augmenté, c'est qu'un ordre BUY a été fill
+      if (yesDelta > 0.001) {
+        log.info({
+          tokenId: yesTokenId.substring(0, 20) + '...',
+          tokenSide: 'YES',
+          oldShares: oldYesShares.toFixed(2),
+          newShares: newYesShares.toFixed(2),
+          delta: yesDelta.toFixed(2)
+        }, "💰 FILL DETECTED BY POLLING (BUY YES)");
+        
+        // 🔄 FIX BUG #3: Replacer immédiatement pour vendre ces shares
+        await this.placeImmediateSellOrder(yesTokenId, yesDelta, 'YES');
+      }
+      
+      if (noDelta > 0.001) {
+        log.info({
+          tokenId: noTokenId.substring(0, 20) + '...',
+          tokenSide: 'NO',
+          oldShares: oldNoShares.toFixed(2),
+          newShares: newNoShares.toFixed(2),
+          delta: noDelta.toFixed(2)
+        }, "💰 FILL DETECTED BY POLLING (BUY NO)");
+        
+        // 🔄 FIX BUG #3: Replacer immédiatement pour vendre ces shares
+        await this.placeImmediateSellOrder(noTokenId, noDelta, 'NO');
+      }
+      
+      // Si l'inventaire a diminué, c'est qu'un ordre SELL a été fill
+      if (yesDelta < -0.001) {
+        log.info({
+          tokenId: yesTokenId.substring(0, 20) + '...',
+          tokenSide: 'YES',
+          oldShares: oldYesShares.toFixed(2),
+          newShares: newYesShares.toFixed(2),
+          delta: yesDelta.toFixed(2)
+        }, "💰 FILL DETECTED BY POLLING (SELL YES) - Profit captured!");
+        
+        // Le cycle est complet : BUY → SELL → Profit !
+        // Replacer un ordre BUY pour continuer le market making
+        const lastPrices = this.feed.getLastPrices(yesTokenId);
+        if (lastPrices && lastPrices.bestBid && lastPrices.bestAsk) {
+          await this.placeOrders(yesTokenId, 
+            { bestBid: lastPrices.bestBid, bestAsk: lastPrices.bestAsk, tickSize: 0.001 }, 
+            'YES', 
+            undefined,
+            { placeBuy: true, placeSell: false }
+          );
+        }
+      }
+      
+      if (noDelta < -0.001) {
+        log.info({
+          tokenId: noTokenId.substring(0, 20) + '...',
+          tokenSide: 'NO',
+          oldShares: oldNoShares.toFixed(2),
+          newShares: newNoShares.toFixed(2),
+          delta: noDelta.toFixed(2)
+        }, "💰 FILL DETECTED BY POLLING (SELL NO) - Profit captured!");
+        
+        // Le cycle est complet : BUY → SELL → Profit !
+        const lastPrices = this.feed.getLastPrices(noTokenId);
+        if (lastPrices && lastPrices.bestBid && lastPrices.bestAsk) {
+          await this.placeOrders(noTokenId, 
+            { bestBid: lastPrices.bestBid, bestAsk: lastPrices.bestAsk, tickSize: 0.001 }, 
+            'NO', 
+            undefined,
+            { placeBuy: true, placeSell: false }
+          );
+        }
+      }
+      
+    } catch (error: any) {
+      log.error({
+        error: error.message,
+        stack: error.stack?.substring(0, 200)
+      }, "❌ Error detecting fills by polling");
+    }
+  }
+
+  /**
+   * 🔄 FIX BUG #3: Place immédiatement un ordre SELL après avoir détecté un fill BUY
+   * Cette fonction garantit qu'on capture le spread le plus vite possible
+   */
+  private async placeImmediateSellOrder(tokenId: string, shares: number, tokenSide: 'YES' | 'NO') {
+    if (!this.marketInfo) return;
+    
+    try {
+      // Récupérer les prix actuels
+      const lastPrices = this.feed.getLastPrices(tokenId);
+      if (!lastPrices || !lastPrices.bestBid || !lastPrices.bestAsk) {
+        log.warn({
+          tokenId: tokenId.substring(0, 20) + '...',
+          reason: "No current prices"
+        }, "⚠️ Cannot place immediate SELL - no prices");
+        return;
+      }
+      
+      const { bestBid, bestAsk } = lastPrices;
+      
+      log.info({
+        tokenId: tokenId.substring(0, 20) + '...',
+        tokenSide,
+        shares: shares.toFixed(2),
+        bestBid: bestBid.toFixed(4),
+        bestAsk: bestAsk.toFixed(4),
+        reason: "Fill detected - placing SELL immediately"
+      }, "🎯 Placing immediate SELL order to capture spread");
+      
+      // Placer UNIQUEMENT un ordre SELL (pas de BUY)
+      await this.placeOrders(tokenId, 
+        { bestBid, bestAsk, tickSize: 0.001 }, 
+        tokenSide, 
+        undefined,
+        { placeBuy: false, placeSell: true }
+      );
+      
+    } catch (error: any) {
+      log.error({
+        error: error.message,
+        tokenId: tokenId.substring(0, 20) + '...'
+      }, "❌ Error placing immediate SELL order");
+    }
+  }
+
+  /**
    * Réconciliation périodique : vérifie que activeOrders correspond à la réalité
    * CRITIQUE : Interroge l'API REST pour obtenir les VRAIS ordres ouverts
    * et corrige activeOrders si divergence (ordres annulés, remplis, ou placés manuellement)
@@ -975,6 +1173,9 @@ export class MarketMaker {
     
     try {
       log.debug("🔄 Starting orders reconciliation...");
+      
+      // 💰 FIX BUG #2: Détecter les fills par polling API AVANT la réconciliation
+      await this.detectFillsByPolling();
       
       // NOUVEAU : Vérifier et cancel les ordres expirés AVANT la réconciliation
       // Cela garantit que le TTL fonctionne même si le prix ne bouge pas
@@ -1364,12 +1565,19 @@ export class MarketMaker {
       return;
     }
 
-    // 🔒 FIX BUG #1: Vérifier si un replacement est déjà en cours pour ce token
+    // 🔒 FIX BUG #1 DUPLICATION CRITIQUE: Vérifier ET annuler timer si replacement en cours
     if (this.replacementInProgress.get(tokenId)) {
+      // NOUVEAU : Annuler le timer en attente car un replacement est déjà actif
+      const existingTimer = this.priceUpdateDebounceTimers.get(tokenId);
+      if (existingTimer) {
+        clearTimeout(existingTimer);
+        this.priceUpdateDebounceTimers.delete(tokenId);
+      }
       log.debug({
         tokenId: tokenId.substring(0, 20) + '...',
-        reason: "Replacement already in progress"
-      }, "⏳ Skipping price update - replacement in progress");
+        reason: "Replacement already in progress",
+        timerCleared: !!existingTimer
+      }, "⏳ Skipping price update - replacement in progress (timer cleared)");
       return;
     }
 
@@ -1390,18 +1598,26 @@ export class MarketMaker {
       clearTimeout(existingTimer);
     }
     
-    // Créer un nouveau timer de debounce (150ms)
+    // 🔒 FIX BUG #1 DUPLICATION CRITIQUE: POSER LE VERROU IMMÉDIATEMENT
+    // AVANT le setTimeout pour éviter que d'autres events WS ne créent d'autres timers
+    this.replacementInProgress.set(tokenId, true);
+    
+    // Créer un nouveau timer de debounce (100ms - réduit de 150ms pour plus de réactivité)
     const debounceTimer = setTimeout(async () => {
-      // Mémoriser ces prix comme traités
-      this.lastProcessedPrices.set(tokenId, { bestBid, bestAsk });
-      this.lastPriceUpdateTime.set(tokenId, Date.now());
-      
-      // Traiter la mise à jour de prix (la vraie logique)
-      await this.processPriceUpdate(tokenId, bestBid, bestAsk, determinedSide);
-      
-      // Nettoyer le timer
-      this.priceUpdateDebounceTimers.delete(tokenId);
-    }, 150); // 150ms de debounce
+      try {
+        // Mémoriser ces prix comme traités
+        this.lastProcessedPrices.set(tokenId, { bestBid, bestAsk });
+        this.lastPriceUpdateTime.set(tokenId, Date.now());
+        
+        // Traiter la mise à jour de prix (la vraie logique)
+        await this.processPriceUpdate(tokenId, bestBid, bestAsk, determinedSide);
+      } finally {
+        // 🔒 TOUJOURS libérer le verrou, même si processPriceUpdate échoue
+        this.replacementInProgress.set(tokenId, false);
+        // Nettoyer le timer
+        this.priceUpdateDebounceTimers.delete(tokenId);
+      }
+    }, 100); // 100ms de debounce (réduit de 150ms)
     
     this.priceUpdateDebounceTimers.set(tokenId, debounceTimer);
   }
@@ -1409,13 +1625,10 @@ export class MarketMaker {
   /**
    * 🔒 FIX BUG #1: Traitement réel de la mise à jour de prix (après debounce)
    * Cette fonction contient la vraie logique qui était dans handlePriceUpdate
+   * NOTE: Le verrou replacementInProgress est déjà posé par handlePriceUpdate AVANT le setTimeout
    */
   private async processPriceUpdate(tokenId: string, bestBid: number, bestAsk: number, determinedSide: 'YES' | 'NO') {
-    // 🔒 FIX BUG #1: Marquer le replacement comme en cours
-    this.replacementInProgress.set(tokenId, true);
-    
-    try {
-      const currentOrders = this.activeOrders.get(tokenId);
+    const currentOrders = this.activeOrders.get(tokenId);
       
       log.info({
         tokenId: tokenId.substring(0, 20) + '...',
@@ -1486,10 +1699,7 @@ export class MarketMaker {
           });
         }
       }
-    } finally {
-      // 🔒 FIX BUG #1: TOUJOURS libérer le verrou, même en cas d'erreur
-      this.replacementInProgress.set(tokenId, false);
-    }
+    // NOTE: Le verrou sera libéré par handlePriceUpdate dans le bloc finally du setTimeout
   }
 
   private shouldReplaceOrders(currentOrders: any, bestBid: number, bestAsk: number, targetSpread: number): boolean {
@@ -1750,6 +1960,10 @@ export class MarketMaker {
   private async placeOrders(tokenId: string, snapshot: any, tokenSide: 'YES' | 'NO', otherSnapshot?: any, options?: { placeBuy?: boolean, placeSell?: boolean }) {
     if (!this.marketInfo) return;
 
+    // Déclarer les variables au niveau de la fonction pour le finally
+    let shouldPlaceBuy = false;
+    let shouldPlaceSell = false;
+
     try {
       // ✅ FIX IMMEDIATE REPLACEMENT: TTL - Annuler les ordres expirés AVANT de placer de nouveaux ordres
       const hadExpiredOrders = await this.cancelExpiredOrders(tokenId);
@@ -1758,18 +1972,15 @@ export class MarketMaker {
           tokenId: tokenId.substring(0, 20) + '...',
           tokenSide
         }, "🔄 Expired orders canceled, proceeding with immediate replacement");
+        
+        // 🔧 CORRECTION CRITIQUE: Déclencher le replacement automatiquement
+        // Attendre un court délai pour que l'annulation soit effective
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
       
-      // Vérifier le capital à risque APRÈS avoir annulé les ordres expirés
-      const currentNotionalAtRisk = this.getNotionalAtRisk();
-      if (currentNotionalAtRisk >= MAX_NOTIONAL_AT_RISK_USDC) {
-        log.warn({
-          currentAtRisk: currentNotionalAtRisk.toFixed(2),
-          maxAllowed: MAX_NOTIONAL_AT_RISK_USDC,
-          tokenId: tokenId.substring(0, 20) + '...'
-        }, "⚠️ Max notional at risk reached, skipping order placement");
-        return;
-      }
+      // 🔥 FIX BUG PRIORITÉ #1: Vérifier le capital à risque UNIQUEMENT pour les BUY
+      // Les SELL d'inventaire existant ne mettent PAS de capital à risque
+      // Cette vérification sera faite plus tard dans placeOrders() pour chaque ordre individuellement
       
       // Calculer les prix avec stratégie de parité (pas besoin de fetchLastPrice ici)
       const prices = await this.calculateOrderPrices(snapshot, tokenSide, tokenId, otherSnapshot);
@@ -1791,8 +2002,8 @@ export class MarketMaker {
       const existingOrders = this.activeOrders.get(tokenId) || {};
       this.activeOrders.set(tokenId, { ...existingOrders, lastMid: midPrice });
 
-      // Obtenir l'inventaire actuel et les limites
-      const currentInventory = this.inventory.getInventory(tokenId);
+      // AMÉLIORATION #3: Obtenir l'inventaire avec rechargement périodique
+      const currentInventory = await this.refreshInventoryIfNeeded(tokenId);
       const maxInventory = tokenSide === 'YES' ? MAX_INVENTORY_YES : MAX_INVENTORY_NO;
       
       log.info({
@@ -1803,9 +2014,37 @@ export class MarketMaker {
         hasInventory: currentInventory > 0
       }, "📦 Current inventory status");
 
+      // AMÉLIORATION #4: TICK IMPROVEMENT AGRESSIF
+      const tickSize = snapshot.tickSize || 0.001;
+      const tickImprovement = tickSize; // 1 tick au lieu de 0.5
+      
+      // Prix avec tick improvement agressif
+      const improvedBidPrice = Math.max(snapshot.bestBid + tickImprovement, bidPrice);
+      const improvedAskPrice = Math.min(snapshot.bestAsk - tickImprovement, askPrice);
+      
+      log.info({
+        tokenId: tokenId.substring(0, 20) + '...',
+        tokenSide,
+        originalBid: bidPrice.toFixed(4),
+        improvedBid: improvedBidPrice.toFixed(4),
+        originalAsk: askPrice.toFixed(4),
+        improvedAsk: improvedAskPrice.toFixed(4),
+        tickSize: tickSize.toFixed(4),
+        tickImprovement: tickImprovement.toFixed(4)
+      }, "🎯 Tick improvement applied");
+      
+      // Utiliser les prix améliorés
+      bidPrice = improvedBidPrice;
+      askPrice = improvedAskPrice;
+      
       // Calculer les tailles séparément pour BUY et SELL
       const buySize = this.calculateOrderSize(bidPrice);
-      const sellSize = currentInventory > 0 ? calculateSellSizeShares(currentInventory, askPrice, MAX_SELL_PER_ORDER_SHARES, 5, MIN_NOTIONAL_SELL_USDC) : null;
+      
+      // 🔥 FIX BUG PRIORITÉ #1: SELL plus agressif si inventaire disponible
+      // Si on a de l'inventaire, on vend TOUT ce qu'on peut (dans les limites)
+      const sellSize = currentInventory > 0 ? 
+        Math.min(currentInventory, MAX_SELL_PER_ORDER_SHARES) : // Vendre jusqu'à la limite max
+        null;
 
       log.info({
         slug: this.marketInfo.slug,
@@ -1824,19 +2063,42 @@ export class MarketMaker {
       const buyAmounts = buySize ? buildAmounts("BUY", bidPrice, buySize) : null;
       const sellAmounts = sellSize ? buildAmounts("SELL", askPrice, sellSize) : null;
       
+      // 🔥 FIX BUG PRIORITÉ #1: Séparer la logique BUY/SELL
+      // BUY: Vérifier USDC + limite de capital
       const buySolvent = buyAmounts ? await this.checkBuySolvency(buyAmounts.makerAmount) : false;
-      const sellSolvent = sellAmounts ? await this.checkSellSolvency(tokenId, sellAmounts.makerAmount) : false;
       const canBuy = buySize !== null && buySolvent && (currentInventory + (buySize || 0)) <= maxInventory;
-      const canSell = sellSize !== null && sellSolvent && currentInventory >= (sellSize || 0);
+      
+      // SELL: Vérifier seulement l'inventaire (pas de limite de capital)
+      // On vend ce qu'on possède déjà, donc pas de risque de capital
+      const canSell = sellSize !== null && currentInventory >= (sellSize || 0);
+      
+      // 🔥 FIX BUG PRIORITÉ #1: Logs détaillés pour debug
+      log.info({
+        tokenId: tokenId.substring(0, 20) + '...',
+        tokenSide,
+        currentInventory: currentInventory.toFixed(2),
+        sellSize: sellSize?.toFixed(2) || 'null',
+        canSell,
+        reason: canSell ? 'Can sell (has inventory)' : 'Cannot sell (no inventory)'
+      }, "🔍 SELL solvency check");
 
       // LOGIQUE DE MARKET MAKING : Placer BUY et SELL simultanément
       // Un market maker doit TOUJOURS offrir des deux côtés du marché
       const hasInventory = currentInventory > 0;
       
-      // CORRECTION : Placer des ordres BUY même avec inventaire (pour capturer le spread)
-      // ✅ FIX: Utiliser let au lieu de const pour permettre les modifications dans la logique d'idempotence
-      let shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false);
-      let shouldPlaceSell = canSell && (parityBias !== 'BUY') && (options?.placeSell !== false);
+      // AMÉLIORATION #1: SELL CONTINU - Toujours vendre si inventaire disponible
+      // ✅ FIX: Assigner aux variables déclarées au niveau de la fonction
+      // 🔧 CORRECTION CRITIQUE: Respecter MAX_ACTIVE_ORDERS_PER_SIDE
+      const canPlaceBuyOrder = this.canPlaceOrderOnSide(tokenId, 'bid');
+      const canPlaceSellOrder = this.canPlaceOrderOnSide(tokenId, 'ask');
+      
+      // 🔥 FIX BUG PRIORITÉ #1: Logique séparée BUY/SELL
+      // BUY: Respecter les limites de capital et de parité
+      shouldPlaceBuy = canBuy && (parityBias !== 'SELL') && (options?.placeBuy !== false) && canPlaceBuyOrder;
+      
+      // SELL: PRIORITÉ ABSOLUE si inventaire disponible (pas de limite de capital)
+      // On vend ce qu'on possède déjà, donc pas de risque financier
+      shouldPlaceSell = canSell && currentInventory > 0 && canPlaceSellOrder && (options?.placeSell !== false);
       
       // DEBUG : Vérifier chaque condition individuellement
       log.debug({
@@ -1868,12 +2130,25 @@ export class MarketMaker {
         reason: hasInventory ? 'Priority to SELL (has inventory)' : 'Normal BUY/SELL logic'
       }, "🎯 Order placement decision");
 
+      // 🔒 CORRECTION FINALE: VERROU PAR TOKENID - Empêcher les placements simultanés sur le même token
+      if (this.placementInProgressByToken.get(tokenId)) {
+        log.debug({
+          tokenId: tokenId.substring(0, 20) + '...',
+          tokenSide,
+          shouldPlaceBuy,
+          shouldPlaceSell
+        }, "⏳ Skipping placement - another placement in progress for this token");
+        return;
+      }
+      
+      // Poser le verrou pour ce tokenId
+      this.placementInProgressByToken.set(tokenId, true);
+
       log.info({
         slug: this.marketInfo.slug,
         tokenId: tokenId.substring(0, 20) + '...',
         tokenSide,
         buySolvent,
-        sellSolvent,
         canBuy,
         canSell,
         shouldPlaceBuy,
@@ -1940,30 +2215,46 @@ export class MarketMaker {
 
           // ✅ FIX: Vérifier à nouveau si on doit placer le BUY
           if (shouldPlaceBuy) {
-            const buyOrder = {
-              deferExec: false,
-              order: { ...buyOrderData, signature: "0x" },
-              owner: process.env.CLOB_API_KEY!,
-              orderType: "GTC" as OrderType
-            };
+            // 🔥 FIX BUG PRIORITÉ #1: Vérifier le capital à risque UNIQUEMENT pour les BUY
+            const currentNotionalAtRisk = this.getNotionalAtRisk();
+            const buyNotional = bidPrice * (buySize || 0);
+            const futureAtRisk = currentNotionalAtRisk + buyNotional;
+            
+            if (futureAtRisk > MAX_NOTIONAL_AT_RISK_USDC) {
+              log.warn({
+                currentAtRisk: currentNotionalAtRisk.toFixed(2),
+                buyNotional: buyNotional.toFixed(2),
+                futureAtRisk: futureAtRisk.toFixed(2),
+                maxAllowed: MAX_NOTIONAL_AT_RISK_USDC,
+                tokenId: tokenId.substring(0, 20) + '...',
+                side: "BUY"
+              }, "⚠️ Max notional at risk would be exceeded by BUY - skipping BUY only");
+              shouldPlaceBuy = false;
+            } else {
+              const buyOrder = {
+                deferExec: false,
+                order: { ...buyOrderData, signature: "0x" },
+                owner: process.env.CLOB_API_KEY!,
+                orderType: "GTC" as OrderType
+              };
 
-            // LOGS FORENSICS : Capture complète au moment du placement
-            log.info({
-              event: "place_attempt",
-            slug: this.marketInfo.slug,
-            tokenId: tokenId.substring(0, 20) + '...',
-            tokenSide,
-            side: "BUY",
-            price: bidPrice.toFixed(4),
-            priceRoundedToTick: (Math.round(bidPrice / 0.001) * 0.001).toFixed(4),
-            size: buySize,
-            notional: (bidPrice * (buySize || 0)).toFixed(5),
-            makerAmount: buyAmounts.makerAmount.toString(),
-            takerAmount: buyAmounts.takerAmount.toString(),
-            currentInventory,
-            tickImprovement: this.config.tickImprovement,
-            timestamp: new Date().toISOString()
-          }, "📤 Placing BUY order (solvent + can buy)");
+              // LOGS FORENSICS : Capture complète au moment du placement
+              log.info({
+                event: "place_attempt",
+              slug: this.marketInfo.slug,
+              tokenId: tokenId.substring(0, 20) + '...',
+              tokenSide,
+              side: "BUY",
+              price: bidPrice.toFixed(4),
+              priceRoundedToTick: (Math.round(bidPrice / 0.001) * 0.001).toFixed(4),
+              size: buySize,
+              notional: (bidPrice * (buySize || 0)).toFixed(5),
+              makerAmount: buyAmounts.makerAmount.toString(),
+              takerAmount: buyAmounts.takerAmount.toString(),
+              currentInventory,
+              tickImprovement: this.config.tickImprovement,
+              timestamp: new Date().toISOString()
+            }, "📤 Placing BUY order (solvent + can buy)");
 
           // DRY RUN: Ne pas placer d'ordres en mode dry-run
           if (this.config.dryRun) {
@@ -2016,7 +2307,8 @@ export class MarketMaker {
               timestamp: new Date().toISOString()
             }, "✅ BUY order POSTED (inventory will update on fill)");
           }
-          } // ✅ FIX: Fin du bloc if (shouldPlaceBuy) imbriqué
+          } // Fin du else (capital OK)
+          } // Fin du if (shouldPlaceBuy)
         } catch (error: any) {
           // Logs HTTP enrichis pour debug des erreurs 403/429/400
           const httpStatus = error.response?.status || error.status;
@@ -2079,6 +2371,8 @@ export class MarketMaker {
       }
 
       // Placer l'ordre SELL si possible
+      // 🔥 FIX BUG PRIORITÉ #1: Les SELL d'inventaire existant ne mettent PAS de capital à risque
+      // On vend ce qu'on possède déjà, donc PAS de vérification du capital ici
       if (shouldPlaceSell) {
         try {
           // Vérifier l'approbation ERC-1155 pour l'Exchange
@@ -2298,18 +2592,81 @@ export class MarketMaker {
           tokenSide
         }, "No orders placed");
       } else {
+        // 🔒 FIX BUG DUPLICATION: Mettre à jour activeOrders IMMÉDIATEMENT pour éviter les doubles placements
+        // Ceci empêche un 2ème appel à placeOrders() de penser qu'il n'y a pas d'ordres actifs
+        const orderId = buyResp?.orderId || buyResp?.orderID;
+        const sellOrderId = sellResp?.orderId || sellResp?.orderID;
+        
+        if (orderId || sellOrderId) {
+          const midPrice = snapshot?.bestBid && snapshot?.bestAsk ? (snapshot.bestBid + snapshot.bestAsk) / 2 : this.activeOrders.get(tokenId)?.lastMid;
+          
+          this.activeOrders.set(tokenId, {
+            ...(this.activeOrders.get(tokenId) || {}),
+            bidId: orderId || this.activeOrders.get(tokenId)?.bidId,
+            askId: sellOrderId || this.activeOrders.get(tokenId)?.askId,
+            bidPrice: buyResp?.success ? bidPrice : this.activeOrders.get(tokenId)?.bidPrice,
+            askPrice: sellResp?.success ? askPrice : this.activeOrders.get(tokenId)?.askPrice,
+            lastPlaceTime: Date.now(),
+            lastMid: midPrice
+          });
+          
+          log.debug({
+            tokenId: tokenId.substring(0, 20) + '...',
+            bidId: orderId || 'unchanged',
+            askId: sellOrderId || 'unchanged'
+          }, "🔒 activeOrders updated immediately to prevent duplicate placements");
+        }
+        
         log.info({
           slug: this.marketInfo.slug,
           tokenId: tokenId.substring(0, 20) + '...',
           tokenSide,
-          buyResp: buyResp?.orderId || buyResp?.orderID || null,
-          sellResp: sellResp?.orderId || sellResp?.orderID || null
+          buyResp: orderId || null,
+          sellResp: sellOrderId || null
         }, "✅ Orders placed successfully");
       }
 
     } catch (error) {
       log.error({ error, tokenId: tokenId.substring(0, 20) + '...', tokenSide }, "❌ Error placing orders");
+    } finally {
+      // 🔓 LIBÉRER LE VERROU PAR TOKENID
+      this.placementInProgressByToken.set(tokenId, false);
     }
+  }
+
+  /**
+   * AMÉLIORATION #3: Rechargement périodique de l'inventaire
+   */
+  private async refreshInventoryIfNeeded(tokenId: string): Promise<number> {
+    const lastSync = this.lastInventorySync.get(tokenId) || 0;
+    const now = Date.now();
+    
+    if (now - lastSync > 30000) { // 30 secondes
+      log.info({
+        tokenId: tokenId.substring(0, 20) + '...',
+        lastSyncAge: ((now - lastSync) / 1000).toFixed(1) + 's'
+      }, "🔄 Refreshing inventory from blockchain");
+      
+      try {
+        // Obtenir l'adresse du propriétaire depuis l'allowance manager
+        const ownerAddress = process.env.CLOB_API_KEY || '';
+        await this.inventory.syncFromOnChainReal(tokenId, ownerAddress);
+        this.lastInventorySync.set(tokenId, now);
+        
+        const newInventory = this.inventory.getInventory(tokenId);
+        log.info({
+          tokenId: tokenId.substring(0, 20) + '...',
+          newInventory: newInventory.toFixed(2)
+        }, "✅ Inventory refreshed from blockchain");
+        
+        return newInventory;
+      } catch (error) {
+        log.error({ error, tokenId: tokenId.substring(0, 20) + '...' }, "❌ Failed to refresh inventory");
+        return this.inventory.getInventory(tokenId); // Retourner l'ancienne valeur
+      }
+    }
+    
+    return this.inventory.getInventory(tokenId);
   }
 
   /**

@@ -139,12 +139,12 @@ export class UserFeed {
         
         const msg = JSON.parse(data);
         
-        // Log tous les messages pour debug
-        log.debug({
+        // 🔍 FIX BUG #2: Logger TOUS les messages bruts pour diagnostic
+        log.info({
           event_type: msg.event_type,
           type: msg.type,
-          message: JSON.stringify(msg)
-        }, "🔍 UserFeed message received");
+          rawMessage: JSON.stringify(msg).substring(0, 500) // Premiers 500 caractères
+        }, "📩 UserFeed RAW message received");
         
         // Fill event (ordre exécuté totalement ou partiellement)
         // ✅ FIX #8: Capturer aussi les événements "trade" qui contiennent les fills partiels
