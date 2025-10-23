@@ -158,6 +158,11 @@ export class MarketMaker {
   private provider: JsonRpcProvider;
   // ✅ FIX #4: Cache des derniers prix traités pour éviter le spam
   private lastProcessedPrices = new Map<string, {bestBid: number, bestAsk: number}>();
+  
+  // 🔒 FIX BUG #1: Verrous pour éviter les placements multiples en rafale
+  private replacementInProgress = new Map<string, boolean>(); // Par tokenId
+  private priceUpdateDebounceTimers = new Map<string, NodeJS.Timeout>(); // Debounce par tokenId
+  private lastPriceUpdateTime = new Map<string, number>(); // Timestamp du dernier traitement
   private inventory: InventoryManager;
   private allowanceManager: AllowanceManager;
   private orderCloser: OrderCloser;
@@ -1359,6 +1364,15 @@ export class MarketMaker {
       return;
     }
 
+    // 🔒 FIX BUG #1: Vérifier si un replacement est déjà en cours pour ce token
+    if (this.replacementInProgress.get(tokenId)) {
+      log.debug({
+        tokenId: tokenId.substring(0, 20) + '...',
+        reason: "Replacement already in progress"
+      }, "⏳ Skipping price update - replacement in progress");
+      return;
+    }
+
     const currentOrders = this.activeOrders.get(tokenId);
     const determinedSide = tokenId === this.marketInfo.yesTokenId ? 'YES' : 'NO';
     
@@ -1369,85 +1383,122 @@ export class MarketMaker {
       return;
     }
     
-    // Mémoriser ces prix comme traités
-    this.lastProcessedPrices.set(tokenId, { bestBid, bestAsk });
+    // 🔒 FIX BUG #1: Debounce - annuler le timer précédent et en créer un nouveau
+    // Cela permet de ne traiter que la DERNIÈRE mise à jour de prix si plusieurs arrivent en rafale
+    const existingTimer = this.priceUpdateDebounceTimers.get(tokenId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
     
-    log.info({
-      tokenId: tokenId.substring(0, 20) + '...',
-      bestBid: bestBid.toFixed(4),
-      bestAsk: bestAsk.toFixed(4),
-      spread: (bestAsk - bestBid).toFixed(4),
-      determinedSide
-    }, "💰 Price update received");
+    // Créer un nouveau timer de debounce (150ms)
+    const debounceTimer = setTimeout(async () => {
+      // Mémoriser ces prix comme traités
+      this.lastProcessedPrices.set(tokenId, { bestBid, bestAsk });
+      this.lastPriceUpdateTime.set(tokenId, Date.now());
+      
+      // Traiter la mise à jour de prix (la vraie logique)
+      await this.processPriceUpdate(tokenId, bestBid, bestAsk, determinedSide);
+      
+      // Nettoyer le timer
+      this.priceUpdateDebounceTimers.delete(tokenId);
+    }, 150); // 150ms de debounce
     
-    log.info({
-      tokenId: tokenId.substring(0, 20) + '...',
-      hasOrders: !!currentOrders,
-      bidId: currentOrders?.bidId || 'none',
-      askId: currentOrders?.askId || 'none',
-      bidPrice: currentOrders?.bidPrice || 'none',
-      askPrice: currentOrders?.askPrice || 'none',
-      lastPlaceTime: currentOrders?.lastPlaceTime || 'none'
-    }, "🔍 Checking active orders");
+    this.priceUpdateDebounceTimers.set(tokenId, debounceTimer);
+  }
+
+  /**
+   * 🔒 FIX BUG #1: Traitement réel de la mise à jour de prix (après debounce)
+   * Cette fonction contient la vraie logique qui était dans handlePriceUpdate
+   */
+  private async processPriceUpdate(tokenId: string, bestBid: number, bestAsk: number, determinedSide: 'YES' | 'NO') {
+    // 🔒 FIX BUG #1: Marquer le replacement comme en cours
+    this.replacementInProgress.set(tokenId, true);
     
-    // ✅ FIX #4: Vérifier le cap d'ordres par side AVANT de placer
-    const needsBid = !currentOrders?.bidId && this.canPlaceOrderOnSide(tokenId, 'bid');
-    const needsAsk = !currentOrders?.askId && this.canPlaceOrderOnSide(tokenId, 'ask');
-    
-    if (needsBid || needsAsk) {
-      // Placer les ordres manquants avec les VRAIS prix WebSocket
+    try {
+      const currentOrders = this.activeOrders.get(tokenId);
+      
       log.info({
         tokenId: tokenId.substring(0, 20) + '...',
-        needsBid,
-        needsAsk,
-        reason: needsBid && needsAsk ? 'No active orders' : needsBid ? 'Missing BUY order' : 'Missing SELL order'
-      }, "🎯 Placing missing orders");
+        bestBid: bestBid.toFixed(4),
+        bestAsk: bestAsk.toFixed(4),
+        spread: (bestAsk - bestBid).toFixed(4),
+        determinedSide
+      }, "💰 Price update received");
       
-      const prices = await this.calculateOrderPrices({ bestBid, bestAsk, tickSize: 0.001 }, determinedSide, tokenId);
-      if (prices) {
-        await this.placeOrders(tokenId, { bestBid, bestAsk, tickSize: 0.001 }, determinedSide, undefined, {
-          placeBuy: needsBid,
-          placeSell: needsAsk
-        });
-      }
-      return;
-    }
-
-    const spread = bestAsk - bestBid;
-    const targetSpread = this.config.targetSpreadCents / 100;
-
-    // Vérifier si nos ordres sont toujours compétitifs
-    const shouldReplace = this.shouldReplaceOrders(currentOrders, bestBid, bestAsk, targetSpread);
-
-    if (shouldReplace) {
-      // ✅ FIX #3 & #6: Replace par side avec cooldown
-      const replaceBid = this.shouldReplaceSide(tokenId, 'bid', currentOrders, bestBid, bestAsk);
-      const replaceAsk = this.shouldReplaceSide(tokenId, 'ask', currentOrders, bestBid, bestAsk);
+      log.info({
+        tokenId: tokenId.substring(0, 20) + '...',
+        hasOrders: !!currentOrders,
+        bidId: currentOrders?.bidId || 'none',
+        askId: currentOrders?.askId || 'none',
+        bidPrice: currentOrders?.bidPrice || 'none',
+        askPrice: currentOrders?.askPrice || 'none',
+        lastPlaceTime: currentOrders?.lastPlaceTime || 'none'
+      }, "🔍 Checking active orders");
       
-      if (replaceBid || replaceAsk) {
+      // ✅ FIX IMMEDIATE REPLACEMENT: Vérifier si on n'a plus d'ordres actifs et replacer immédiatement
+      const needsBid = !currentOrders?.bidId && this.canPlaceOrderOnSide(tokenId, 'bid');
+      const needsAsk = !currentOrders?.askId && this.canPlaceOrderOnSide(tokenId, 'ask');
+      
+      if (needsBid || needsAsk) {
+        // Placer les ordres manquants avec les VRAIS prix WebSocket (replacement immédiat)
         log.info({
           tokenId: tokenId.substring(0, 20) + '...',
-          currentSpread: spread.toFixed(3),
-          targetSpread: targetSpread.toFixed(3),
-          currentMid: ((bestBid + bestAsk) / 2).toFixed(4),
-          lastMid: currentOrders?.lastMid?.toFixed(4) || 'N/A',
-          replaceBid,
-          replaceAsk
-        }, "🔄 Replacing orders due to price change or competition");
+          needsBid,
+          needsAsk,
+          reason: needsBid && needsAsk ? 'No active orders - IMMEDIATE REPLACEMENT' : needsBid ? 'Missing BUY order' : 'Missing SELL order'
+        }, "⚡ Placing missing orders immediately");
         
-        await this.replaceOrdersBySide(tokenId, { bestBid, bestAsk, tickSize: 0.001 }, determinedSide, {
-          replaceBid,
-          replaceAsk
-        });
+        const prices = await this.calculateOrderPrices({ bestBid, bestAsk, tickSize: 0.001 }, determinedSide, tokenId);
+        if (prices) {
+          await this.placeOrders(tokenId, { bestBid, bestAsk, tickSize: 0.001 }, determinedSide, undefined, {
+            placeBuy: needsBid,
+            placeSell: needsAsk
+          });
+        }
+        return;
       }
+
+      const spread = bestAsk - bestBid;
+      const targetSpread = this.config.targetSpreadCents / 100;
+
+      // Vérifier si nos ordres sont toujours compétitifs
+      const shouldReplace = this.shouldReplaceOrders(currentOrders, bestBid, bestAsk, targetSpread);
+
+      if (shouldReplace) {
+        // ✅ FIX #3 & #6: Replace par side avec cooldown
+        const replaceBid = this.shouldReplaceSide(tokenId, 'bid', currentOrders, bestBid, bestAsk);
+        const replaceAsk = this.shouldReplaceSide(tokenId, 'ask', currentOrders, bestBid, bestAsk);
+        
+        if (replaceBid || replaceAsk) {
+          log.info({
+            tokenId: tokenId.substring(0, 20) + '...',
+            currentSpread: spread.toFixed(3),
+            targetSpread: targetSpread.toFixed(3),
+            currentMid: ((bestBid + bestAsk) / 2).toFixed(4),
+            lastMid: currentOrders?.lastMid?.toFixed(4) || 'N/A',
+            replaceBid,
+            replaceAsk
+          }, "🔄 Replacing orders due to price change or competition");
+          
+          await this.replaceOrdersBySide(tokenId, { bestBid, bestAsk, tickSize: 0.001 }, determinedSide, {
+            replaceBid,
+            replaceAsk
+          });
+        }
+      }
+    } finally {
+      // 🔒 FIX BUG #1: TOUJOURS libérer le verrou, même en cas d'erreur
+      this.replacementInProgress.set(tokenId, false);
     }
   }
 
   private shouldReplaceOrders(currentOrders: any, bestBid: number, bestAsk: number, targetSpread: number): boolean {
-    // Remplacer si nos ordres ne sont plus au top (not inside)
-    const ourBidIsBest = currentOrders.bidPrice && currentOrders.bidPrice >= bestBid;
-    const ourAskIsBest = currentOrders.askPrice && currentOrders.askPrice <= bestAsk;
-    const notInside = !ourBidIsBest || !ourAskIsBest;
+    // ✅ FIX PRICE TRACKING: Améliorer la détection des ordres hors du top book
+    // Vérifier si nos ordres sont AU TOP BOOK (pas juste inside)
+    const tickSize = 0.001;
+    const ourBidIsTopBook = currentOrders.bidPrice && Math.abs(currentOrders.bidPrice - bestBid) < tickSize / 2;
+    const ourAskIsTopBook = currentOrders.askPrice && Math.abs(currentOrders.askPrice - bestAsk) < tickSize / 2;
+    const notAtTopBook = (currentOrders.bidId && !ourBidIsTopBook) || (currentOrders.askId && !ourAskIsTopBook);
     
     // Remplacer si le mid-price a bougé significativement
     const currentMid = (bestBid + bestAsk) / 2;
@@ -1463,9 +1514,9 @@ export class MarketMaker {
       marketBid: bestBid.toFixed(4),
       ourAsk: currentOrders.askPrice?.toFixed(4) || 'none',
       marketAsk: bestAsk.toFixed(4),
-      ourBidIsBest,
-      ourAskIsBest,
-      notInside,
+      ourBidIsTopBook,
+      ourAskIsTopBook,
+      notAtTopBook,
       currentMid: currentMid.toFixed(4),
       lastMid: lastMid.toFixed(4),
       priceMovement,
@@ -1473,7 +1524,7 @@ export class MarketMaker {
       orderAge: (orderAge / 1000).toFixed(1) + 's',
       orderTooOld,
       ttl: (ORDER_TTL_MS / 1000).toFixed(1) + 's',
-      shouldReplace: notInside || priceMovement || orderTooOld
+      shouldReplace: notAtTopBook || priceMovement || orderTooOld
     }, "🔍 Replace orders check");
     
     if (priceMovement) {
@@ -1492,16 +1543,16 @@ export class MarketMaker {
       }, "⏰ Order TTL reached, replacing orders");
     }
     
-    if (notInside) {
+    if (notAtTopBook) {
       log.info({
         ourBid: currentOrders.bidPrice?.toFixed(4) || 'N/A',
         marketBid: bestBid.toFixed(4),
         ourAsk: currentOrders.askPrice?.toFixed(4) || 'N/A',
         marketAsk: bestAsk.toFixed(4)
-      }, "🎯 Not inside market, replacing orders");
+      }, "🎯 Not at top book, replacing orders");
     }
     
-    return notInside || priceMovement || orderTooOld;
+    return notAtTopBook || priceMovement || orderTooOld;
   }
 
   private canReplaceOrders(): boolean {
@@ -1700,8 +1751,14 @@ export class MarketMaker {
     if (!this.marketInfo) return;
 
     try {
-      // TTL: Annuler les ordres expirés AVANT de placer de nouveaux ordres
-      await this.cancelExpiredOrders(tokenId);
+      // ✅ FIX IMMEDIATE REPLACEMENT: TTL - Annuler les ordres expirés AVANT de placer de nouveaux ordres
+      const hadExpiredOrders = await this.cancelExpiredOrders(tokenId);
+      if (hadExpiredOrders) {
+        log.info({
+          tokenId: tokenId.substring(0, 20) + '...',
+          tokenSide
+        }, "🔄 Expired orders canceled, proceeding with immediate replacement");
+      }
       
       // Vérifier le capital à risque APRÈS avoir annulé les ordres expirés
       const currentNotionalAtRisk = this.getNotionalAtRisk();
@@ -1832,12 +1889,25 @@ export class MarketMaker {
       // Placer l'ordre BUY si possible
       if (shouldPlaceBuy) {
         try {
+          // ✅ FIX DOUBLE PLACEMENT: Vérifier si on a déjà un ordre BUY actif AVANT de créer un nouveau
+          const existingOrders = this.activeOrders.get(tokenId);
+          if (existingOrders?.bidId) {
+            log.info({
+              existingOrderId: existingOrders.bidId.substring(0, 16) + '...',
+              existingPrice: existingOrders.bidPrice?.toFixed(4),
+              newPrice: bidPrice.toFixed(4),
+              tokenId: tokenId.substring(0, 20) + '...',
+              side: "BUY"
+            }, "⚠️ BUY order already exists - skipping duplicate placement");
+            shouldPlaceBuy = false;
+          }
+          
           const maker = this.clob.getMakerAddress();
           const signer = this.clob.getAddress();
           const buyAmounts = buildAmounts("BUY", bidPrice, buySize!);
           const buyOrderData = buildOrder("BUY", tokenId, bidPrice, buySize!, maker, signer);
           
-          // IDEMPOTENCE : Vérifier si le clientOrderId existe déjà
+          // IDEMPOTENCE SECONDAIRE : Vérifier si le clientOrderId existe déjà (backup)
           if (this.placedClientOrderIds.has(buyOrderData.clientOrderId)) {
             log.warn({
               clientOrderId: buyOrderData.clientOrderId,
@@ -2031,12 +2101,25 @@ export class MarketMaker {
           }
           
           if (shouldPlaceSell) {
+            // ✅ FIX DOUBLE PLACEMENT: Vérifier si on a déjà un ordre SELL actif AVANT de créer un nouveau
+            const existingOrders = this.activeOrders.get(tokenId);
+            if (existingOrders?.askId) {
+              log.info({
+                existingOrderId: existingOrders.askId.substring(0, 16) + '...',
+                existingPrice: existingOrders.askPrice?.toFixed(4),
+                newPrice: askPrice.toFixed(4),
+                tokenId: tokenId.substring(0, 20) + '...',
+                side: "SELL"
+              }, "⚠️ SELL order already exists - skipping duplicate placement");
+              shouldPlaceSell = false;
+            }
+            
             const maker = this.clob.getMakerAddress();
           const signer = this.clob.getAddress();
           const sellAmounts = buildAmounts("SELL", askPrice, sellSize!);
           const sellOrderData = buildOrder("SELL", tokenId, askPrice, sellSize!, maker, signer);
           
-          // IDEMPOTENCE : Vérifier si le clientOrderId existe déjà
+          // IDEMPOTENCE SECONDAIRE : Vérifier si le clientOrderId existe déjà (backup)
           if (this.placedClientOrderIds.has(sellOrderData.clientOrderId)) {
             log.warn({
               clientOrderId: sellOrderData.clientOrderId,
@@ -2676,10 +2759,11 @@ export class MarketMaker {
   /**
    * Annule les ordres expirés (TTL dépassé) pour un token donné
    * CRITIQUE: Empêche l'accumulation d'ordres fantômes
+   * ✅ FIX IMMEDIATE REPLACEMENT: Déclenche un replacement immédiat après annulation
    */
-  private async cancelExpiredOrders(tokenId: string): Promise<void> {
+  private async cancelExpiredOrders(tokenId: string): Promise<boolean> {
     const orders = this.activeOrders.get(tokenId);
-    if (!orders) return;
+    if (!orders) return false;
 
     const now = Date.now();
     const orderAge = now - (orders.lastPlaceTime || 0);
@@ -2719,7 +2803,9 @@ export class MarketMaker {
           log.info({
             tokenId: tokenId.substring(0, 20) + '...',
             canceled: toCancel.length
-          }, "✅ Expired orders canceled successfully");
+          }, "✅ Expired orders canceled successfully - will replace immediately");
+          
+          return true; // Retourne true pour indiquer qu'un replacement est nécessaire
         } catch (error) {
           log.error({ 
             error, 
@@ -2729,6 +2815,7 @@ export class MarketMaker {
         }
       }
     }
+    return false;
   }
 
   private async cancelOrders(tokenId: string) {
